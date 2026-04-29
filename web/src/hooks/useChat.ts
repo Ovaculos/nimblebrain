@@ -13,21 +13,44 @@ import type {
   StreamErrorEvent,
   TextDeltaEvent,
   ToolDoneEvent,
+  ToolPreparingDoneEvent,
+  ToolPreparingEvent,
   ToolStartEvent,
 } from "../types";
 
 /**
  * Streaming state machine:
  *
- *   null → thinking → streaming ↔ working → analyzing → streaming → null
- *                                                    ↘ working (next tool.start)
+ *   null → thinking → streaming ↔ preparing → working → analyzing → streaming → null
+ *                                                              ↘ working (next tool.start)
  *
  * `analyzing` fills the gap between the last tool.done (all tools finished)
  * and the next text.delta / tool.start, when the model is inferring on tool
- * results but the UI would otherwise look frozen. Any `tool.start` can
- * re-enter `working` from a non-terminal state.
+ * results but the UI would otherwise look frozen.
+ *
+ * `preparing` fills the model-side gap: after text/reasoning has streamed
+ * within an iteration, the model may continue emitting a large tool-call
+ * input block (45 KB+ for full-document writes). No deltas fire during
+ * that window — without `preparing`, the indicator goes dark for as long
+ * as it takes the LLM to emit the args. `tool.preparing` fires on
+ * `tool-input-start` from the AI SDK; `tool.start` follows once the
+ * iteration finishes and the engine begins execution.
+ *
+ * Any `tool.start` can re-enter `working` from a non-terminal state.
  */
-export type StreamingState = null | "thinking" | "streaming" | "working" | "analyzing";
+export type StreamingState =
+  | null
+  | "thinking"
+  | "streaming"
+  | "preparing"
+  | "working"
+  | "analyzing";
+
+/** Identifies the tool the model is currently building a call for. */
+export interface PreparingTool {
+  id: string;
+  name: string;
+}
 
 /** Typed tool result shape forwarded through the bridge. */
 export interface ToolResultForUI {
@@ -111,6 +134,8 @@ export interface UseChatReturn {
   messages: ChatMessage[];
   isStreaming: boolean;
   streamingState: StreamingState;
+  /** Set while streamingState === "preparing"; null otherwise. */
+  preparingTool: PreparingTool | null;
   conversationId: string | null;
   conversationMeta: LoadedConversationMeta | null;
   error: string | null;
@@ -180,6 +205,7 @@ export function useChat(initialConversationId?: string, currentUserId?: string):
   );
   const [error, setError] = useState<string | null>(null);
   const [streamingState, setStreamingState] = useState<StreamingState>(null);
+  const [preparingTool, setPreparingTool] = useState<PreparingTool | null>(null);
   const [conversationMeta, setConversationMeta] = useState<LoadedConversationMeta | null>(null);
 
   // Refs for building the current assistant message during streaming.
@@ -274,6 +300,12 @@ export function useChat(initialConversationId?: string, currentUserId?: string):
             case "text.delta": {
               const evt = data as TextDeltaEvent;
               setStreamingState((prev) => (prev !== "streaming" ? "streaming" : prev));
+              // Defensive: keeps `preparingTool` paired with the
+              // `"preparing"` streamingState. Render sites gate on the
+              // state, so stale data never shows today, but a future
+              // caller reading `preparingTool` directly would otherwise
+              // see a tool name from a long-finished iteration.
+              setPreparingTool(null);
               // Append to last text block or create a new one
               const blocks = blocksRef.current;
               const lastBlock = blocks[blocks.length - 1];
@@ -288,6 +320,7 @@ export function useChat(initialConversationId?: string, currentUserId?: string):
             case "reasoning.delta": {
               const evt = data as ReasoningDeltaEvent;
               setStreamingState((prev) => (prev !== "streaming" ? "streaming" : prev));
+              setPreparingTool(null);
               const blocks = blocksRef.current;
               const lastBlock = blocks[blocks.length - 1];
               if (lastBlock && lastBlock.type === "reasoning") {
@@ -298,9 +331,22 @@ export function useChat(initialConversationId?: string, currentUserId?: string):
               flushToMessage();
               break;
             }
+            case "tool.preparing": {
+              const evt = data as ToolPreparingEvent;
+              setStreamingState("preparing");
+              setPreparingTool({ id: evt.id, name: evt.name });
+              break;
+            }
+            case "tool.preparing.done": {
+              // No state change — `tool.start` follows once the iteration
+              // ends and the engine begins execution. Holding `preparing`
+              // through the gap keeps the indicator stable.
+              break;
+            }
             case "tool.start": {
               const evt = data as ToolStartEvent;
               setStreamingState("working");
+              setPreparingTool(null);
               const separatorIdx = evt.name.indexOf("__");
               const newTool: ToolCallDisplay = {
                 id: evt.id,
@@ -355,6 +401,7 @@ export function useChat(initialConversationId?: string, currentUserId?: string):
             case "done": {
               const result = data as ChatResult;
               setStreamingState(null);
+              setPreparingTool(null);
               setConversationId(result.conversationId);
 
               // Backfill tool results from done event
@@ -410,6 +457,7 @@ export function useChat(initialConversationId?: string, currentUserId?: string):
             case "error": {
               const evt = data as StreamErrorEvent;
               setStreamingState(null);
+              setPreparingTool(null);
               // Stamp the error on the last assistant message so it renders
               // inline — not as a disconnected banner at the top.
               setMessages((prev) => {
@@ -467,6 +515,7 @@ export function useChat(initialConversationId?: string, currentUserId?: string):
       } finally {
         setIsStreaming(false);
         setStreamingState(null);
+        setPreparingTool(null);
       }
     },
     // biome-ignore lint/correctness/useExhaustiveDependencies: sendMessage captures streaming/conversation state via refs
@@ -480,6 +529,7 @@ export function useChat(initialConversationId?: string, currentUserId?: string):
     setError(null);
     setIsStreaming(false);
     setStreamingState(null);
+    setPreparingTool(null);
     blocksRef.current = [];
     toolCallsRef.current = [];
     iterationRef.current = undefined;
@@ -565,6 +615,7 @@ export function useChat(initialConversationId?: string, currentUserId?: string):
         case "text.delta": {
           const evt = data as TextDeltaEvent;
           setStreamingState((prev) => (prev !== "streaming" ? "streaming" : prev));
+          setPreparingTool(null);
           const blocks = blocksRef.current;
           const lastBlock = blocks[blocks.length - 1];
           if (lastBlock && lastBlock.type === "text") {
@@ -578,6 +629,7 @@ export function useChat(initialConversationId?: string, currentUserId?: string):
         case "reasoning.delta": {
           const evt = data as ReasoningDeltaEvent;
           setStreamingState((prev) => (prev !== "streaming" ? "streaming" : prev));
+          setPreparingTool(null);
           const blocks = blocksRef.current;
           const lastBlock = blocks[blocks.length - 1];
           if (lastBlock && lastBlock.type === "reasoning") {
@@ -588,9 +640,19 @@ export function useChat(initialConversationId?: string, currentUserId?: string):
           flushToMessage();
           break;
         }
+        case "tool.preparing": {
+          const evt = data as ToolPreparingEvent;
+          setStreamingState("preparing");
+          setPreparingTool({ id: evt.id, name: evt.name });
+          break;
+        }
+        case "tool.preparing.done": {
+          break;
+        }
         case "tool.start": {
           const evt = data as ToolStartEvent;
           setStreamingState("working");
+          setPreparingTool(null);
           const separatorIdx = evt.name.indexOf("__");
           const newTool: ToolCallDisplay = {
             id: evt.id,
@@ -638,6 +700,7 @@ export function useChat(initialConversationId?: string, currentUserId?: string):
         case "done": {
           const result = data as ChatResult;
           setStreamingState(null);
+          setPreparingTool(null);
           setIsStreaming(false);
 
           if (result.toolCalls) {
@@ -708,6 +771,7 @@ export function useChat(initialConversationId?: string, currentUserId?: string):
     setError(null);
     setIsStreaming(false);
     setStreamingState(null);
+    setPreparingTool(null);
   }, []);
 
   // Effect: once isStreaming is false and there's a pending retry, fire it.
@@ -741,6 +805,7 @@ export function useChat(initialConversationId?: string, currentUserId?: string):
       return updated;
     });
     setStreamingState(null);
+    setPreparingTool(null);
     setIsStreaming(false);
   }, []);
 
@@ -748,6 +813,7 @@ export function useChat(initialConversationId?: string, currentUserId?: string):
     messages,
     isStreaming,
     streamingState,
+    preparingTool,
     conversationId,
     conversationMeta,
     error,
