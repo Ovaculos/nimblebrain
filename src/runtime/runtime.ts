@@ -52,10 +52,9 @@ import {
   loadSkillDir,
   mergeScopedSkills,
   partitionSkills,
-  readSkillMtime,
 } from "../skills/loader.ts";
 import { SkillMatcher } from "../skills/matcher.ts";
-import { type SelectedSkill, selectLayer3Skills } from "../skills/select.ts";
+import { selectLayer3Skills } from "../skills/select.ts";
 import { approxTokens } from "../skills/tokens.ts";
 import type { Skill } from "../skills/types.ts";
 import { TelemetryManager } from "../telemetry/manager.ts";
@@ -73,6 +72,7 @@ import {
   type RequestContext,
   runWithRequestContext,
 } from "./request-context.ts";
+import { buildSkillsLoadedPayload } from "./skills-loaded-payload.ts";
 import { surfaceTools } from "./tools.ts";
 import type { ChatRequest, ChatResult, ModelSlots, RuntimeConfig, TurnUsage } from "./types.ts";
 import { createWorkspaceRegistry, startWorkspaceBundles } from "./workspace-runtime.ts";
@@ -1871,31 +1871,6 @@ function stampDerivedScope(workDir: string, skill: Skill): Skill {
     ...skill,
     manifest: { ...skill.manifest, scope: isOrg ? "org" : "bundle" },
   };
-}
-
-/**
- * Build the `skills.loaded` payload from the Layer 3 selection result. Each
- * entry carries id (sourcePath or "in-memory" sentinel), scope, version
- * (file mtime), tokens (approximate), `loadedBy`, and the matcher's reason
- * string. Total is the sum of per-skill tokens.
- */
-function buildSkillsLoadedPayload(selected: SelectedSkill[]): SkillsLoadedPayload {
-  const entries = selected.map((s) => {
-    const body = s.skill.body;
-    const tokens = approxTokens(body);
-    const sourcePath = s.skill.sourcePath || "";
-    return {
-      id: sourcePath || `skill-in-memory:${s.skill.manifest.name}`,
-      layer: 3 as const,
-      scope: (s.skill.manifest.scope ?? "org") as "org" | "workspace" | "user" | "bundle",
-      version: sourcePath ? readSkillMtime(sourcePath) : "",
-      tokens,
-      loadedBy: s.loadedBy,
-      reason: s.reason,
-    };
-  });
-  const totalTokens = entries.reduce((sum, e) => sum + e.tokens, 0);
-  return { skills: entries, totalTokens };
 }
 
 /**
