@@ -1,16 +1,48 @@
 /**
  * Cost estimation and usage formatting.
  *
- * One function, one signature: `estimateCost(model, usage)`. Pricing data
- * comes from the model catalog (src/model/catalog.ts), which is vendored
- * from models.dev. Run `bun run sync-models` to refresh.
+ * `costBreakdown(model, usage)` is the single source of truth for the
+ * arithmetic. `estimateCost(...)` is sugar for `.total`. The
+ * usage-aggregator's per-bucket dashboard math reads the same struct,
+ * so the dashboard total can never silently diverge from the live
+ * per-turn cost.
+ *
+ * Pricing data comes from the model catalog (src/model/catalog.ts),
+ * which is vendored from models.dev. Run `bun run sync-models` to refresh.
  */
 
 import { getModelByString } from "../model/catalog.ts";
 import type { TokenUsage } from "./types.ts";
 
 /**
- * Estimate cost in USD from token usage. Returns 0 for unknown models.
+ * Per-bucket cost in USD plus the total. The four buckets always sum to
+ * `total` (within float epsilon).
+ *
+ * Note that `output` includes reasoning-token cost: when a model has a
+ * distinct `cost.reasoning` rate, the reasoning subset bills at that
+ * rate and the remainder bills at `cost.output`, with both summed into
+ * the `output` bucket. Reasoning IS output tokens — splitting at the
+ * rate boundary is a billing concern, not a UX one.
+ */
+export interface CostBreakdownUsd {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  total: number;
+}
+
+const ZERO_BREAKDOWN: CostBreakdownUsd = {
+  input: 0,
+  output: 0,
+  cacheRead: 0,
+  cacheWrite: 0,
+  total: 0,
+};
+
+/**
+ * Decompose token usage into per-bucket cost in USD. Returns all-zeros
+ * for unknown models.
  *
  * Pricing model — input side: per AI SDK V3 (LanguageModelV3Usage),
  * `inputTokens` is the GRAND TOTAL of all input-side tokens, equal to
@@ -31,9 +63,9 @@ import type { TokenUsage } from "./types.ts";
  * all output tokens bill at `cost.output`, including any reasoning
  * subtotal.
  */
-export function estimateCost(modelString: string, usage: TokenUsage): number {
+export function costBreakdown(modelString: string, usage: TokenUsage): CostBreakdownUsd {
   const model = getModelByString(modelString);
-  if (!model) return 0;
+  if (!model) return { ...ZERO_BREAKDOWN };
   const c = model.cost;
 
   const cacheRead = usage.cacheReadTokens ?? 0;
@@ -45,14 +77,23 @@ export function estimateCost(modelString: string, usage: TokenUsage): number {
     c.reasoning != null ? Math.max(usage.outputTokens - reasoning, 0) : usage.outputTokens;
   const reasoningCost = c.reasoning != null ? reasoning * c.reasoning : 0;
 
-  return (
-    (inputNonCached * c.input +
-      outputNonReasoning * c.output +
-      reasoningCost +
-      cacheRead * (c.cacheRead ?? c.input) +
-      cacheWrite * (c.cacheWrite ?? c.input)) /
-    1_000_000
-  );
+  const input = (inputNonCached * c.input) / 1_000_000;
+  const output = (outputNonReasoning * c.output + reasoningCost) / 1_000_000;
+  const cacheReadCost = (cacheRead * (c.cacheRead ?? c.input)) / 1_000_000;
+  const cacheWriteCost = (cacheWrite * (c.cacheWrite ?? c.input)) / 1_000_000;
+
+  return {
+    input,
+    output,
+    cacheRead: cacheReadCost,
+    cacheWrite: cacheWriteCost,
+    total: input + output + cacheReadCost + cacheWriteCost,
+  };
+}
+
+/** Estimate cost in USD from token usage. Returns 0 for unknown models. */
+export function estimateCost(modelString: string, usage: TokenUsage): number {
+  return costBreakdown(modelString, usage).total;
 }
 
 /** Format USD cost for display. Sub-penny values shown as cents. */

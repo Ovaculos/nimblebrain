@@ -227,15 +227,24 @@ export interface StreamErrorEvent {
   retryAfter?: number;
 }
 
+/**
+ * Token usage carried on llm.done SSE events. Mirrors the runtime's
+ * canonical `TokenUsage` (src/usage/types.ts). Web is a separate package
+ * so the shape is duplicated rather than imported — keep in sync.
+ */
+export interface UsageShape {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  reasoningTokens?: number;
+}
+
 export interface LlmDoneEvent {
   runId: string;
   model: string;
-  inputTokens: number;
-  outputTokens: number;
-  /** Reasoning-token subtotal (subset of outputTokens). 0 if absent. */
-  reasoningTokens?: number;
-  cacheReadTokens: number;
-  cacheCreationTokens: number;
+  /** Token usage for this single LLM call (canonical AI SDK V3 shape). */
+  usage: UsageShape;
   llmMs: number;
   /**
    * Per-call finish reason (AI SDK V3 unified). Optional for backward

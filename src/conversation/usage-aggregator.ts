@@ -14,7 +14,7 @@
 import { readdirSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { getModelByString } from "../model/catalog.ts";
+import { costBreakdown } from "../usage/cost.ts";
 import type { TokenUsage } from "../usage/types.ts";
 
 // ---------------------------------------------------------------------------
@@ -88,13 +88,13 @@ function createCostBreakdown(): CostBreakdown {
 
 /**
  * Decompose a model's TokenUsage into the four cost-bearing buckets
- * (input/output/cacheRead/cacheWrite). `usage.inputTokens` is the AI SDK
- * V3 grand total — already includes cacheRead and cacheWrite — so we
- * subtract those before applying the full input rate. Clamp to 0 guards
- * against corrupted records where the cache subtotals exceed the total.
- *
- * Returns parallel TokenBreakdown and CostBreakdown so the UI can display
- * "tokens by bucket" and "cost by bucket" with matching arithmetic.
+ * (input/output/cacheRead/cacheWrite) plus parallel cost numbers. Cost
+ * comes from `costBreakdown` in src/usage/cost.ts — single source of
+ * truth, so the dashboard total can't drift from the live per-turn
+ * `usage.costUsd`. Token-side math: `usage.inputTokens` is the AI SDK
+ * V3 grand total (includes cacheRead and cacheWrite); the `input`
+ * bucket is the non-cached portion. Clamp to 0 guards against corrupted
+ * records where the cache subtotals exceed the total.
  */
 function decomposeUsage(record: LlmCallRecord): { tokens: TokenBreakdown; cost: CostBreakdown } {
   const cacheRead = record.usage.cacheReadTokens ?? 0;
@@ -108,34 +108,7 @@ function decomposeUsage(record: LlmCallRecord): { tokens: TokenBreakdown; cost: 
     cacheWrite,
   };
 
-  const model = getModelByString(record.model);
-  if (!model) {
-    return { tokens, cost: createCostBreakdown() };
-  }
-  const c = model.cost;
-  // Mirror the reasoning-token split from src/usage/cost.ts so the
-  // dashboard total can never silently diverge from the live per-turn
-  // `usage.costUsd` once a model adds a separate `cost.reasoning` rate.
-  // Reasoning is folded back into the `output` bucket for display
-  // (reasoning IS output tokens — splitting at the rate boundary is a
-  // billing concern, not a UX one).
-  const reasoning = record.usage.reasoningTokens ?? 0;
-  const outputNonReasoning =
-    c.reasoning != null
-      ? Math.max(record.usage.outputTokens - reasoning, 0)
-      : record.usage.outputTokens;
-  const reasoningCost = c.reasoning != null ? reasoning * c.reasoning : 0;
-  const inputCost = (inputNonCached * c.input) / 1_000_000;
-  const outputCost = (outputNonReasoning * c.output + reasoningCost) / 1_000_000;
-  const cacheReadCost = (cacheRead * (c.cacheRead ?? c.input)) / 1_000_000;
-  const cacheWriteCost = (cacheWrite * (c.cacheWrite ?? c.input)) / 1_000_000;
-  const cost: CostBreakdown = {
-    input: inputCost,
-    output: outputCost,
-    cacheRead: cacheReadCost,
-    cacheWrite: cacheWriteCost,
-    total: inputCost + outputCost + cacheReadCost + cacheWriteCost,
-  };
+  const cost = costBreakdown(record.model, record.usage);
   return { tokens, cost };
 }
 

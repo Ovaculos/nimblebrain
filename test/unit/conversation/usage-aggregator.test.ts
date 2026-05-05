@@ -260,6 +260,67 @@ describe("usage-aggregator", () => {
     const expectedTotal = estimateCost("claude-sonnet-4-5-20250929", usage);
     expect(report.totals.cost.total).toBeCloseTo(expectedTotal, 8);
   });
+
+  it("UsageReport shape contract — pins the wire-format key set", async () => {
+    // Regression: external consumers (web shell, dashboards) read fields
+    // off this report. A silent rename here is what produced the
+    // `cost.cacheCreation` → `cacheWrite` cross-package breakage that
+    // crashed the web/src/pages/settings/UsageTab. Pin the exact key
+    // set so any future rename fails this test instead of going
+    // unnoticed until a UI panel throws on render.
+    const dir = makeTmpDir();
+    writeFileSync(
+      join(dir, "shape.jsonl"),
+      buildJsonl({ id: "shape", updatedAt: "2026-04-10T10:00:00Z" }, [
+        llmEvent({
+          model: "claude-sonnet-4-5-20250929",
+          inputTokens: 1000,
+          outputTokens: 500,
+          cacheReadTokens: 100,
+          cacheWriteTokens: 200,
+        }),
+      ]),
+    );
+    const report = await aggregateUsage(dir, "all", "day");
+
+    // Top-level
+    expect(Object.keys(report).sort()).toEqual(["breakdown", "models", "period", "totals"]);
+
+    // totals.tokens — exact bucket set; if a rename happens, this fails
+    expect(Object.keys(report.totals.tokens).sort()).toEqual([
+      "cacheRead",
+      "cacheWrite",
+      "input",
+      "output",
+    ]);
+
+    // totals.cost — same buckets plus `total`
+    expect(Object.keys(report.totals.cost).sort()).toEqual([
+      "cacheRead",
+      "cacheWrite",
+      "input",
+      "output",
+      "total",
+    ]);
+
+    // models[] entry shape
+    expect(report.models.length).toBeGreaterThan(0);
+    const m = report.models[0]!;
+    expect(Object.keys(m).sort()).toEqual(["cost", "llmCalls", "model", "tokens"]);
+    expect(Object.keys(m.tokens).sort()).toEqual(["cacheRead", "cacheWrite", "input", "output"]);
+    expect(Object.keys(m.cost).sort()).toEqual([
+      "cacheRead",
+      "cacheWrite",
+      "input",
+      "output",
+      "total",
+    ]);
+
+    // breakdown[] entry shape
+    expect(report.breakdown.length).toBeGreaterThan(0);
+    const b = report.breakdown[0]!;
+    expect(Object.keys(b).sort()).toEqual(["conversations", "cost", "key", "llmCalls", "tokens"]);
+  });
 });
 
 // ---------------------------------------------------------------------------

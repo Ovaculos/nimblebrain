@@ -19,14 +19,14 @@ interface TokenBreakdown {
   input: number;
   output: number;
   cacheRead: number;
-  cacheCreation: number;
+  cacheWrite: number;
 }
 
 interface CostBreakdown {
   input: number;
   output: number;
   cacheRead: number;
-  cacheCreation: number;
+  cacheWrite: number;
   total: number;
 }
 
@@ -184,7 +184,7 @@ function UsageBody({ report }: { report: UsageReport }) {
               <CostRow label="Input" value={formatUsdPrecise(cost.input)} />
               <CostRow label="Output" value={formatUsdPrecise(cost.output)} />
               <CostRow label="Cache read" value={formatUsdPrecise(cost.cacheRead)} />
-              <CostRow label="Cache write" value={formatUsdPrecise(cost.cacheCreation)} />
+              <CostRow label="Cache write" value={formatUsdPrecise(cost.cacheWrite)} />
             </div>
           </CardContent>
         </Card>
