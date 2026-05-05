@@ -132,9 +132,6 @@ export class EventSourcedConversationStore implements ConversationStore, EventSi
       createdAt: now,
       updatedAt: now,
       title: null,
-      totalInputTokens: 0,
-      totalOutputTokens: 0,
-      totalCostUsd: 0,
       lastModel: null,
       format: "events",
       ...(options?.workspaceId ? { workspaceId: options.workspaceId } : {}),
@@ -167,9 +164,6 @@ export class EventSourcedConversationStore implements ConversationStore, EventSi
       createdAt: raw.createdAt as string,
       updatedAt: (raw.updatedAt as string) ?? (raw.createdAt as string),
       title: (raw.title as string | null) ?? null,
-      totalInputTokens: (raw.totalInputTokens as number) ?? 0,
-      totalOutputTokens: (raw.totalOutputTokens as number) ?? 0,
-      totalCostUsd: (raw.totalCostUsd as number) ?? 0,
       lastModel: (raw.lastModel as string | null) ?? null,
       ...(raw.format ? { format: raw.format as "events" } : {}),
       ...(raw.workspaceId ? { workspaceId: raw.workspaceId as string } : {}),
@@ -183,10 +177,7 @@ export class EventSourcedConversationStore implements ConversationStore, EventSi
     if (lines.length > 1) {
       const events = safeParseLines<ConversationEvent>(lines.slice(1));
       const usage = deriveUsageMetrics(events);
-      if (usage.totalInputTokens > 0 || usage.totalOutputTokens > 0) {
-        conversation.totalInputTokens = usage.totalInputTokens;
-        conversation.totalOutputTokens = usage.totalOutputTokens;
-        conversation.totalCostUsd = usage.totalCostUsd;
+      if (usage.lastModel) {
         conversation.lastModel = usage.lastModel;
       }
       // Derive title, visibility, participants from metadata events
@@ -252,10 +243,10 @@ export class EventSourcedConversationStore implements ConversationStore, EventSi
           runId,
           model: message.metadata.model ?? "unknown",
           content: message.content as LlmResponseEvent["content"],
-          inputTokens: message.metadata.inputTokens ?? 0,
-          outputTokens: message.metadata.outputTokens ?? 0,
-          cacheReadTokens: message.metadata.cacheReadTokens ?? 0,
-          cacheCreationTokens: 0,
+          usage: message.metadata.usage ?? {
+            inputTokens: 0,
+            outputTokens: 0,
+          },
           llmMs: message.metadata.llmMs ?? 0,
         };
         const runDone: ConversationEvent = {
@@ -278,9 +269,6 @@ export class EventSourcedConversationStore implements ConversationStore, EventSi
     // Legacy format — same pattern as JsonlConversationStore
     const path = this.path(conversation.id);
     if (message.role === "assistant" && message.metadata) {
-      conversation.totalInputTokens += message.metadata.inputTokens ?? 0;
-      conversation.totalOutputTokens += message.metadata.outputTokens ?? 0;
-      conversation.totalCostUsd += message.metadata.costUsd ?? 0;
       conversation.lastModel = message.metadata.model ?? conversation.lastModel;
     }
     conversation.updatedAt = message.timestamp;
@@ -367,12 +355,10 @@ export class EventSourcedConversationStore implements ConversationStore, EventSi
     const newConv = await this.create();
 
     if (messagesToCopy.length > 0) {
+      // Token totals are derived from events; only carry lastModel forward.
       for (const msg of messagesToCopy) {
-        if (msg.role === "assistant" && msg.metadata) {
-          newConv.totalInputTokens += msg.metadata.inputTokens ?? 0;
-          newConv.totalOutputTokens += msg.metadata.outputTokens ?? 0;
-          newConv.totalCostUsd += msg.metadata.costUsd ?? 0;
-          newConv.lastModel = msg.metadata.model ?? newConv.lastModel;
+        if (msg.role === "assistant" && msg.metadata?.model) {
+          newConv.lastModel = msg.metadata.model;
         }
       }
       newConv.updatedAt =
@@ -398,10 +384,7 @@ export class EventSourcedConversationStore implements ConversationStore, EventSi
               runId: "forked",
               model: msg.metadata?.model ?? "unknown",
               content: msg.content,
-              inputTokens: msg.metadata?.inputTokens ?? 0,
-              outputTokens: msg.metadata?.outputTokens ?? 0,
-              cacheReadTokens: msg.metadata?.cacheReadTokens ?? 0,
-              cacheCreationTokens: 0,
+              usage: msg.metadata?.usage ?? { inputTokens: 0, outputTokens: 0 },
               llmMs: msg.metadata?.llmMs ?? 0,
             }),
           );
@@ -518,19 +501,14 @@ export class EventSourcedConversationStore implements ConversationStore, EventSi
 
       case "llm.done": {
         const finishReason = d.finishReason as LlmResponseEvent["finishReason"];
-        const reasoningTokens = (d.reasoningTokens as number) ?? 0;
         const e: LlmResponseEvent = {
           ts,
           type: "llm.response",
           runId,
           model: d.model as string,
           content: (d.content ?? []) as LlmResponseEvent["content"],
-          inputTokens: (d.inputTokens as number) ?? 0,
-          outputTokens: (d.outputTokens as number) ?? 0,
-          cacheReadTokens: (d.cacheReadTokens as number) ?? 0,
-          cacheCreationTokens: (d.cacheCreationTokens as number) ?? 0,
+          usage: d.usage as LlmResponseEvent["usage"],
           llmMs: (d.llmMs as number) ?? 0,
-          ...(reasoningTokens > 0 ? { reasoningTokens } : {}),
           ...(finishReason !== undefined ? { finishReason } : {}),
         };
         return e;

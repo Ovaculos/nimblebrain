@@ -30,14 +30,14 @@ const MESSAGES = [
 		role: "assistant",
 		content: "Hi! How can I help you today?",
 		timestamp: "2025-06-01T10:02:00.000Z",
-		metadata: { inputTokens: 300, outputTokens: 200, model: "claude-sonnet-4-5-20250929" },
+		metadata: { usage: { inputTokens: 300, outputTokens: 200 }, model: "claude-sonnet-4-5-20250929" },
 	},
 	{ role: "user", content: "Tell me about MCP", timestamp: "2025-06-01T10:03:00.000Z" },
 	{
 		role: "assistant",
 		content: "MCP stands for Model Context Protocol. It provides a standard way for AI models to interact with tools.",
 		timestamp: "2025-06-01T10:04:00.000Z",
-		metadata: { inputTokens: 500, outputTokens: 400, model: "claude-sonnet-4-5-20250929" },
+		metadata: { usage: { inputTokens: 500, outputTokens: 400 }, model: "claude-sonnet-4-5-20250929" },
 	},
 ];
 
@@ -109,8 +109,7 @@ describe("handleExport — markdown", () => {
 				content: "I found some files.",
 				timestamp: "2025-06-01T10:02:00.000Z",
 				metadata: {
-					inputTokens: 300,
-					outputTokens: 200,
+					usage: { inputTokens: 300, outputTokens: 200 },
 					toolCalls: [
 						{
 							id: "tc_001",

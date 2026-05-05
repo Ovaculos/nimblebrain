@@ -140,15 +140,28 @@ interface RunStartEvent {
   runId: string;
 }
 
+/**
+ * Token usage shape mirrored from the runtime's canonical TokenUsage.
+ * This bundle is intentionally self-contained (no imports from runtime),
+ * so the shape is duplicated rather than imported. Keep in sync with
+ * src/usage/types.ts.
+ */
+interface UsageShape {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  reasoningTokens?: number;
+}
+
 interface LlmResponseEvent {
   ts: string;
   type: "llm.response";
   runId: string;
   model: string;
   content: ContentPart[];
-  inputTokens: number;
-  outputTokens: number;
-  cacheReadTokens: number;
+  /** Absent on pre-unification legacy events. Reads must tolerate missing. */
+  usage?: UsageShape;
   llmMs: number;
 }
 
@@ -258,8 +271,8 @@ function deriveMetricsFromLines(lines: string[]): DerivedMetrics {
     if (!evt) continue;
     lastEventTs = evt.ts;
     if (isLlmResponse(evt)) {
-      totalInputTokens += evt.inputTokens;
-      totalOutputTokens += evt.outputTokens;
+      totalInputTokens += evt.usage?.inputTokens ?? 0;
+      totalOutputTokens += evt.usage?.outputTokens ?? 0;
       lastModel = evt.model;
     }
   }
@@ -488,12 +501,15 @@ function collectRun(
       flatToolCalls.push(...tools);
     }
 
-    // Usage — aggregate across all llm.responses in the run.
-    inputTokens += llm.inputTokens;
-    outputTokens += llm.outputTokens;
-    if (typeof llm.cacheReadTokens === "number" && llm.cacheReadTokens > 0) {
+    // Usage — aggregate across all llm.responses in the run. `usage` is
+    // optional on the wire (absent on pre-unification legacy events); the
+    // run-level total just contributes zero in that case.
+    inputTokens += llm.usage?.inputTokens ?? 0;
+    outputTokens += llm.usage?.outputTokens ?? 0;
+    const llmCacheRead = llm.usage?.cacheReadTokens ?? 0;
+    if (llmCacheRead > 0) {
       hasCacheReads = true;
-      cacheReadTokens += llm.cacheReadTokens;
+      cacheReadTokens += llmCacheRead;
     }
     llmMs += llm.llmMs;
     model = llm.model;
@@ -654,14 +670,13 @@ function buildLegacyBlocks(content: string, tools: DisplayToolCall[] | undefined
 }
 
 function buildLegacyUsageFromMetadata(metadata: Record<string, unknown>): DisplayUsage | undefined {
-  const inputTokens = metadata.inputTokens;
-  const outputTokens = metadata.outputTokens;
-  if (inputTokens == null && outputTokens == null) return undefined;
+  const usage = metadata.usage as UsageShape | undefined;
+  if (!usage) return undefined;
   return {
-    inputTokens: typeof inputTokens === "number" ? inputTokens : 0,
-    outputTokens: typeof outputTokens === "number" ? outputTokens : 0,
-    ...(typeof metadata.cacheReadTokens === "number"
-      ? { cacheReadTokens: metadata.cacheReadTokens }
+    inputTokens: usage.inputTokens,
+    outputTokens: usage.outputTokens,
+    ...(typeof usage.cacheReadTokens === "number"
+      ? { cacheReadTokens: usage.cacheReadTokens }
       : {}),
     model: typeof metadata.model === "string" ? metadata.model : "unknown",
     llmMs: typeof metadata.llmMs === "number" ? metadata.llmMs : 0,

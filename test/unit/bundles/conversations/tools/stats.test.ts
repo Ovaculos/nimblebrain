@@ -21,8 +21,13 @@ interface ConvOptions {
 		metadata?: {
 			model?: string;
 			skill?: string | null;
-			inputTokens?: number;
-			outputTokens?: number;
+			usage?: {
+				inputTokens?: number;
+				outputTokens?: number;
+				cacheReadTokens?: number;
+				cacheWriteTokens?: number;
+				reasoningTokens?: number;
+			};
 			toolCalls?: Array<{
 				id: string;
 				name: string;
@@ -112,14 +117,14 @@ describe("handleStats", () => {
 					role: "assistant",
 					content: "Hello",
 					timestamp: new Date().toISOString(),
-					metadata: { model: "claude-sonnet-4-5-20250929", inputTokens: 200, outputTokens: 100 },
+					metadata: { model: "claude-sonnet-4-5-20250929", usage: { inputTokens: 200, outputTokens: 100 } },
 				},
 				{ role: "user", content: "More", timestamp: new Date().toISOString() },
 				{
 					role: "assistant",
 					content: "Sure",
 					timestamp: new Date().toISOString(),
-					metadata: { model: "claude-sonnet-4-5-20250929", inputTokens: 400, outputTokens: 300 },
+					metadata: { model: "claude-sonnet-4-5-20250929", usage: { inputTokens: 400, outputTokens: 300 } },
 				},
 			],
 		});
@@ -149,7 +154,7 @@ describe("handleStats", () => {
 					role: "assistant",
 					content: "Hello",
 					timestamp: now,
-					metadata: { model: "model-a", inputTokens: 100, outputTokens: 50 },
+					metadata: { model: "model-a", usage: { inputTokens: 100, outputTokens: 50 } },
 				},
 			],
 		});
@@ -164,14 +169,14 @@ describe("handleStats", () => {
 					role: "assistant",
 					content: "Hello",
 					timestamp: now,
-					metadata: { model: "model-a", inputTokens: 100, outputTokens: 40 },
+					metadata: { model: "model-a", usage: { inputTokens: 100, outputTokens: 40 } },
 				},
 				{ role: "user", content: "More", timestamp: now },
 				{
 					role: "assistant",
 					content: "Sure",
 					timestamp: now,
-					metadata: { model: "model-a", inputTokens: 100, outputTokens: 40 },
+					metadata: { model: "model-a", usage: { inputTokens: 100, outputTokens: 40 } },
 				},
 			],
 		});
@@ -348,7 +353,7 @@ describe("handleStats", () => {
 					role: "assistant",
 					content: "Hello",
 					timestamp: now,
-					metadata: { model: "model-x", inputTokens: 100, outputTokens: 50 },
+					metadata: { model: "model-x", usage: { inputTokens: 100, outputTokens: 50 } },
 				},
 			],
 		});

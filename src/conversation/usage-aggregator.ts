@@ -15,6 +15,7 @@ import { readdirSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { getModelByString } from "../model/catalog.ts";
+import type { TokenUsage } from "../usage/types.ts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -24,10 +25,7 @@ interface LlmCallRecord {
   ts: string;
   sid?: string;
   model: string;
-  inputTokens: number;
-  outputTokens: number;
-  cacheReadTokens: number;
-  cacheCreationTokens: number;
+  usage: TokenUsage;
   llmMs: number;
 }
 
@@ -35,14 +33,14 @@ interface TokenBreakdown {
   input: number;
   output: number;
   cacheRead: number;
-  cacheCreation: number;
+  cacheWrite: number;
 }
 
 interface CostBreakdown {
   input: number;
   output: number;
   cacheRead: number;
-  cacheCreation: number;
+  cacheWrite: number;
   total: number;
 }
 
@@ -81,60 +79,66 @@ export interface UsageReport {
 // ---------------------------------------------------------------------------
 
 function createTokenBreakdown(): TokenBreakdown {
-  return { input: 0, output: 0, cacheRead: 0, cacheCreation: 0 };
+  return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 }
 
 function createCostBreakdown(): CostBreakdown {
-  return { input: 0, output: 0, cacheRead: 0, cacheCreation: 0, total: 0 };
+  return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
 }
 
-function computeCost(record: LlmCallRecord): CostBreakdown {
+/**
+ * Decompose a model's TokenUsage into the four cost-bearing buckets
+ * (input/output/cacheRead/cacheWrite). `usage.inputTokens` is the AI SDK
+ * V3 grand total — already includes cacheRead and cacheWrite — so we
+ * subtract those before applying the full input rate. Clamp to 0 guards
+ * against corrupted records where the cache subtotals exceed the total.
+ *
+ * Returns parallel TokenBreakdown and CostBreakdown so the UI can display
+ * "tokens by bucket" and "cost by bucket" with matching arithmetic.
+ */
+function decomposeUsage(record: LlmCallRecord): { tokens: TokenBreakdown; cost: CostBreakdown } {
+  const cacheRead = record.usage.cacheReadTokens ?? 0;
+  const cacheWrite = record.usage.cacheWriteTokens ?? 0;
+  const inputNonCached = Math.max(record.usage.inputTokens - cacheRead - cacheWrite, 0);
+
+  const tokens: TokenBreakdown = {
+    input: inputNonCached,
+    output: record.usage.outputTokens,
+    cacheRead,
+    cacheWrite,
+  };
+
   const model = getModelByString(record.model);
-  if (!model) return createCostBreakdown();
-
+  if (!model) {
+    return { tokens, cost: createCostBreakdown() };
+  }
   const c = model.cost;
-  // `record.inputTokens` is the AI SDK V3 grand total — already includes
-  // cacheRead and cacheCreation. Subtract them before applying the full
-  // input rate so cache tokens aren't billed twice. Clamp to 0 to guard
-  // against corrupted records where the cache subtotals exceed the total.
-  const inputNonCached = Math.max(
-    record.inputTokens - record.cacheReadTokens - record.cacheCreationTokens,
-    0,
-  );
   const inputCost = (inputNonCached * c.input) / 1_000_000;
-  const outputCost = (record.outputTokens * c.output) / 1_000_000;
-  const cacheReadCost = (record.cacheReadTokens * (c.cacheRead ?? c.input)) / 1_000_000;
-  const cacheCreationCost = (record.cacheCreationTokens * (c.cacheWrite ?? c.input)) / 1_000_000;
-
-  return {
+  const outputCost = (record.usage.outputTokens * c.output) / 1_000_000;
+  const cacheReadCost = (cacheRead * (c.cacheRead ?? c.input)) / 1_000_000;
+  const cacheWriteCost = (cacheWrite * (c.cacheWrite ?? c.input)) / 1_000_000;
+  const cost: CostBreakdown = {
     input: inputCost,
     output: outputCost,
     cacheRead: cacheReadCost,
-    cacheCreation: cacheCreationCost,
-    total: inputCost + outputCost + cacheReadCost + cacheCreationCost,
+    cacheWrite: cacheWriteCost,
+    total: inputCost + outputCost + cacheReadCost + cacheWriteCost,
   };
+  return { tokens, cost };
 }
 
-function addTokens(target: TokenBreakdown, record: LlmCallRecord): void {
-  // `record.inputTokens` is the AI SDK V3 grand total. Surface the
-  // non-cached portion as `input` so `input + cacheRead + cacheCreation`
-  // sums to the grand total cleanly (same shape as the Anthropic
-  // dashboard) and parallels the cost breakdown.
-  const inputNonCached = Math.max(
-    record.inputTokens - record.cacheReadTokens - record.cacheCreationTokens,
-    0,
-  );
-  target.input += inputNonCached;
-  target.output += record.outputTokens;
-  target.cacheRead += record.cacheReadTokens;
-  target.cacheCreation += record.cacheCreationTokens;
+function addTokens(target: TokenBreakdown, src: TokenBreakdown): void {
+  target.input += src.input;
+  target.output += src.output;
+  target.cacheRead += src.cacheRead;
+  target.cacheWrite += src.cacheWrite;
 }
 
 function addCost(target: CostBreakdown, cost: CostBreakdown): void {
   target.input += cost.input;
   target.output += cost.output;
   target.cacheRead += cost.cacheRead;
-  target.cacheCreation += cost.cacheCreation;
+  target.cacheWrite += cost.cacheWrite;
   target.total += cost.total;
 }
 
@@ -244,15 +248,12 @@ export async function aggregateUsage(
         continue;
       }
 
-      if (entry.type === "llm.response") {
+      if (entry.type === "llm.response" && entry.usage) {
         records.push({
           ts: (entry.ts as string) ?? "",
           sid,
           model: (entry.model as string) ?? "unknown",
-          inputTokens: (entry.inputTokens as number) ?? 0,
-          outputTokens: (entry.outputTokens as number) ?? 0,
-          cacheReadTokens: (entry.cacheReadTokens as number) ?? 0,
-          cacheCreationTokens: (entry.cacheCreationTokens as number) ?? 0,
+          usage: entry.usage as TokenUsage,
           llmMs: (entry.llmMs as number) ?? 0,
         });
       }
@@ -275,9 +276,9 @@ export async function aggregateUsage(
   >();
 
   for (const record of records) {
-    const cost = computeCost(record);
+    const { tokens, cost } = decomposeUsage(record);
 
-    addTokens(totals.tokens, record);
+    addTokens(totals.tokens, tokens);
     addCost(totals.cost, cost);
     totals.llmMs += record.llmMs;
     if (record.sid) conversationIds.add(record.sid);
@@ -293,7 +294,7 @@ export async function aggregateUsage(
       });
     }
     const m = modelMap.get(modelKey)!;
-    addTokens(m.tokens, record);
+    addTokens(m.tokens, tokens);
     addCost(m.cost, cost);
     m.llmCalls++;
 
@@ -314,7 +315,7 @@ export async function aggregateUsage(
       });
     }
     const b = breakdownMap.get(key)!;
-    addTokens(b.tokens, record);
+    addTokens(b.tokens, tokens);
     addCost(b.cost, cost);
     b.llmCalls++;
     if (record.sid) b.sids.add(record.sid);

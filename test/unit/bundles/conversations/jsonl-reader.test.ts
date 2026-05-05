@@ -181,9 +181,7 @@ describe("readConversation (event format)", () => {
 				runId,
 				model: "m1",
 				content: [{ type: "text", text: "I'll look it up." }],
-				inputTokens: 10,
-				outputTokens: 5,
-				cacheReadTokens: 0,
+				usage: { inputTokens: 10, outputTokens: 5, cacheReadTokens: 0 },
 				llmMs: 100,
 			}),
 			JSON.stringify({
@@ -194,9 +192,7 @@ describe("readConversation (event format)", () => {
 				content: [
 					{ type: "tool-call", toolCallId: "t1", toolName: "search", input: { q: "foo" } },
 				],
-				inputTokens: 15,
-				outputTokens: 8,
-				cacheReadTokens: 0,
+				usage: { inputTokens: 15, outputTokens: 8, cacheReadTokens: 0 },
 				llmMs: 120,
 			}),
 			JSON.stringify({
@@ -215,9 +211,7 @@ describe("readConversation (event format)", () => {
 				runId,
 				model: "m1",
 				content: [{ type: "text", text: "Here's what I found." }],
-				inputTokens: 30,
-				outputTokens: 7,
-				cacheReadTokens: 0,
+				usage: { inputTokens: 30, outputTokens: 7, cacheReadTokens: 0 },
 				llmMs: 80,
 			}),
 			JSON.stringify({ ts: "2025-06-01T00:00:06.000Z", type: "run.done", runId, stopReason: "complete" }),
@@ -273,9 +267,7 @@ describe("readConversation (event format)", () => {
 				content: [
 					{ type: "tool-call", toolCallId: "t2", toolName: "patch_source", input: {} },
 				],
-				inputTokens: 5,
-				outputTokens: 2,
-				cacheReadTokens: 0,
+				usage: { inputTokens: 5, outputTokens: 2, cacheReadTokens: 0 },
 				llmMs: 50,
 			}),
 			JSON.stringify({
@@ -318,9 +310,7 @@ describe("readConversation (event format)", () => {
 						input: {},
 					},
 				],
-				inputTokens: 1,
-				outputTokens: 1,
-				cacheReadTokens: 0,
+				usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0 },
 				llmMs: 1,
 			}),
 			JSON.stringify({
@@ -353,9 +343,7 @@ describe("readConversation (event format)", () => {
 				runId,
 				model: "m1",
 				content: [{ type: "text", text: "partial" }],
-				inputTokens: 1,
-				outputTokens: 1,
-				cacheReadTokens: 0,
+				usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0 },
 				llmMs: 1,
 			}),
 			JSON.stringify({
@@ -382,9 +370,7 @@ describe("readConversation (event format)", () => {
 				runId,
 				model: "m1",
 				content: [{ type: "text", text: "before failure" }],
-				inputTokens: 1,
-				outputTokens: 1,
-				cacheReadTokens: 0,
+				usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0 },
 				llmMs: 1,
 			}),
 			JSON.stringify({

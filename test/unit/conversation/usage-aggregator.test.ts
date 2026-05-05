@@ -51,17 +51,19 @@ function llmEvent(overrides: Partial<{
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens: number;
-  cacheCreationTokens: number;
+  cacheWriteTokens: number;
   llmMs: number;
 }> = {}): Record<string, unknown> {
   return {
     type: "llm.response",
     ts: overrides.ts ?? "2026-04-10T12:00:00Z",
     model: overrides.model ?? "claude-sonnet-4-5-20250929",
-    inputTokens: overrides.inputTokens ?? 1000,
-    outputTokens: overrides.outputTokens ?? 500,
-    cacheReadTokens: overrides.cacheReadTokens ?? 0,
-    cacheCreationTokens: overrides.cacheCreationTokens ?? 0,
+    usage: {
+      inputTokens: overrides.inputTokens ?? 1000,
+      outputTokens: overrides.outputTokens ?? 500,
+      cacheReadTokens: overrides.cacheReadTokens ?? 0,
+      cacheWriteTokens: overrides.cacheWriteTokens ?? 0,
+    },
     llmMs: overrides.llmMs ?? 200,
   };
 }
@@ -129,8 +131,8 @@ describe("usage-aggregator", () => {
   it("computes cost correctly from model catalog", async () => {
     const dir = makeTmpDir();
     // claude-sonnet-4-5-20250929: input=$3/M, output=$15/M, cacheRead=$0.30/M, cacheWrite=$3.75/M
-    // AI SDK V3 contract: inputTokens is grand total = noCache + cacheRead + cacheCreation.
-    // So 2_000_000 total = 500K noCache + 500K cacheRead + 1M cacheCreation.
+    // AI SDK V3 contract: inputTokens is grand total = noCache + cacheRead + cacheWrite.
+    // So 2_000_000 total = 500K noCache + 500K cacheRead + 1M cacheWrite.
     writeFileSync(
       join(dir, "cost.jsonl"),
       buildJsonl({ id: "cost-conv", updatedAt: "2026-04-10T10:00:00Z" }, [
@@ -139,7 +141,7 @@ describe("usage-aggregator", () => {
           inputTokens: 2_000_000,
           outputTokens: 1_000_000,
           cacheReadTokens: 500_000,
-          cacheCreationTokens: 1_000_000,
+          cacheWriteTokens: 1_000_000,
         }),
       ]),
     );
@@ -151,13 +153,13 @@ describe("usage-aggregator", () => {
     expect(cost.input).toBeCloseTo(1.5, 4);
     expect(cost.output).toBeCloseTo(15.0, 4);
     expect(cost.cacheRead).toBeCloseTo(0.15, 4);
-    expect(cost.cacheCreation).toBeCloseTo(3.75, 4);
+    expect(cost.cacheWrite).toBeCloseTo(3.75, 4);
     expect(cost.total).toBeCloseTo(1.5 + 15.0 + 0.15 + 3.75, 4);
 
     // Token breakdown: input is the non-cached portion, not the grand total.
     expect(report.totals.tokens.input).toBe(500_000);
     expect(report.totals.tokens.cacheRead).toBe(500_000);
-    expect(report.totals.tokens.cacheCreation).toBe(1_000_000);
+    expect(report.totals.tokens.cacheWrite).toBe(1_000_000);
     expect(report.totals.tokens.output).toBe(1_000_000);
   });
 

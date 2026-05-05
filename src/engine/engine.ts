@@ -20,6 +20,8 @@ import {
   textContent,
 } from "./content-helpers.ts";
 import { withRetry } from "./retry.ts";
+import { addUsage, emptyUsage } from "../usage/types.ts";
+import type { TokenUsage } from "../usage/types.ts";
 import type {
   EngineConfig,
   EngineResult,
@@ -243,8 +245,8 @@ export class AgentEngine {
     const maxIter = Math.min(config.maxIterations, MAX_ITERATIONS);
 
     let iteration = 0;
-    let cumulativeInputTokens = 0;
-    let cumulativeOutputTokens = 0;
+    const cumulativeUsage: TokenUsage = emptyUsage();
+    let cumulativeLlmMs = 0;
     let output = "";
     const allToolCalls: ToolCallRecord[] = [];
     const runId = crypto.randomUUID();
@@ -391,14 +393,20 @@ export class AgentEngine {
           }
         }
 
-        // Accumulate tokens
-        const turnInputTokens = response.usage.inputTokens.total ?? 0;
-        const turnOutputTokens = response.usage.outputTokens.total ?? 0;
-        const turnReasoningTokens = response.usage.outputTokens.reasoning ?? 0;
-        const turnCacheReadTokens = response.usage.inputTokens.cacheRead ?? 0;
-        const turnCacheCreationTokens = response.usage.inputTokens.cacheWrite ?? 0;
-        cumulativeInputTokens += turnInputTokens;
-        cumulativeOutputTokens += turnOutputTokens;
+        // Map the AI SDK V3 usage shape into our canonical TokenUsage.
+        // V3's `inputTokens.total` is the grand total (noCache+cacheRead+
+        // cacheWrite); we preserve that semantics on TokenUsage.inputTokens
+        // and surface the cache subsets as siblings. Cost computation
+        // subtracts the subsets from the totals — see src/usage/cost.ts.
+        const turnUsage: TokenUsage = {
+          inputTokens: response.usage.inputTokens.total ?? 0,
+          outputTokens: response.usage.outputTokens.total ?? 0,
+          cacheReadTokens: response.usage.inputTokens.cacheRead ?? 0,
+          cacheWriteTokens: response.usage.inputTokens.cacheWrite ?? 0,
+          reasoningTokens: response.usage.outputTokens.reasoning ?? 0,
+        };
+        addUsage(cumulativeUsage, turnUsage);
+        cumulativeLlmMs += llmMs;
 
         // Track the model's per-call finish reason for downstream
         // observability and the run-level stop reason derivation below.
@@ -413,11 +421,7 @@ export class AgentEngine {
             runId,
             model: config.model,
             content: response.content,
-            inputTokens: turnInputTokens,
-            outputTokens: turnOutputTokens,
-            reasoningTokens: turnReasoningTokens,
-            cacheReadTokens: turnCacheReadTokens,
-            cacheCreationTokens: turnCacheCreationTokens,
+            usage: turnUsage,
             llmMs,
             finishReason: lastFinishReason,
           },
@@ -663,8 +667,8 @@ export class AgentEngine {
       output,
       toolCalls: allToolCalls,
       iterations: iteration + (iteration < maxIter ? 1 : 0),
-      inputTokens: cumulativeInputTokens,
-      outputTokens: cumulativeOutputTokens,
+      usage: cumulativeUsage,
+      llmMs: cumulativeLlmMs,
       stopReason,
       ...(lastFinishReason !== undefined ? { finishReason: lastFinishReason } : {}),
     };

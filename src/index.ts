@@ -40,8 +40,8 @@ export type {
 } from "./conversation/index.ts";
 // Conversation
 export { InMemoryConversationStore, JsonlConversationStore } from "./conversation/index.ts";
-export type { TokenUsage } from "./engine/cost.ts";
-export { estimateCost } from "./engine/cost.ts";
+export type { TokenUsage } from "./usage/types.ts";
+export { estimateCost } from "./usage/cost.ts";
 export type {
   EngineConfig,
   EngineEvent,

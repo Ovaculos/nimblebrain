@@ -1,5 +1,5 @@
 import { describe, expect, it, test } from "bun:test";
-import { estimateCost } from "../../src/engine/cost.ts";
+import { estimateCost } from "../../src/usage/cost.ts";
 import { getModelByString } from "../../src/model/catalog.ts";
 
 describe("estimateCost", () => {
