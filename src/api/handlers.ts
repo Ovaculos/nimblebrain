@@ -1393,7 +1393,11 @@ export async function handleBundleUpload(
 
   const fileEntry = formData.get("file") ?? formData.get("bundle");
   if (!fileEntry || typeof fileEntry === "string") {
-    return apiError(400, "bad_request", "No bundle file in request (use the 'file' or 'bundle' field)");
+    return apiError(
+      400,
+      "bad_request",
+      "No bundle file in request (use the 'file' or 'bundle' field)",
+    );
   }
 
   const entry = fileEntry as unknown as {

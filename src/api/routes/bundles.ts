@@ -13,9 +13,7 @@ export function bundleRoutes(ctx: AppContext) {
     .use("*", requireAuth(ctx.authOptions))
     .use("*", requireWorkspace(ctx.workspaceStore))
     .use("*", errorLog(ctx))
-    .post(
-      "/v1/bundles/upload",
-      bodyLimit(1_048_576, { multipart: MAX_BUNDLE_SIZE }),
-      (c) => handleBundleUpload(c.req.raw, ctx.runtime, c.var.workspaceId),
+    .post("/v1/bundles/upload", bodyLimit(1_048_576, { multipart: MAX_BUNDLE_SIZE }), (c) =>
+      handleBundleUpload(c.req.raw, ctx.runtime, c.var.workspaceId),
     );
 }
