@@ -5,8 +5,7 @@ export const USAGE_DASHBOARD_SCRIPT =
   `
 const app = document.getElementById("app");
 
-function fmtCost(n) { return n < 0.01 ? "$" + (n * 100).toFixed(2) + "c" : "$" + n.toFixed(2); }
-function fmtCostPrecise(n) { return "$" + n.toFixed(4); }
+function fmtCost(n) { return n < 0.01 ? (n * 100).toFixed(2) + "¢" : "$" + n.toFixed(2); }
 function fmtTokens(n) {
   if (n >= 1000000) return (n / 1000000).toFixed(1) + "M";
   if (n >= 1000) return Math.round(n / 1000) + "K";
@@ -26,7 +25,7 @@ function render(data) {
 
   var modelRows = models.map(function(m) {
     return '<tr><td>' + shortModel(m.model) + '</td>'
-      + '<td class="right">' + fmtCostPrecise(m.cost.total) + '</td>'
+      + '<td class="right">' + fmtCost(m.cost.total) + '</td>'
       + '<td class="right">' + m.llmCalls + '</td></tr>';
   }).join("") || '<tr><td colspan="3" class="empty">No data</td></tr>';
 
@@ -35,7 +34,7 @@ function render(data) {
       + '<td class="right">' + fmtTokens(d.tokens.input) + '</td>'
       + '<td class="right">' + fmtTokens(d.tokens.output) + '</td>'
       + '<td class="right">' + fmtTokens(d.tokens.cacheRead) + '</td>'
-      + '<td class="right">' + fmtCostPrecise(d.cost.total) + '</td>'
+      + '<td class="right">' + fmtCost(d.cost.total) + '</td>'
       + '<td class="right">' + d.llmCalls + '</td></tr>';
   }).join("") || '<tr><td colspan="6" class="empty">No data for this period</td></tr>';
 
@@ -49,9 +48,9 @@ function render(data) {
     '<div class="stats-grid">' +
     '<div class="stat"><div class="stat-value">' + fmtCost(cost.total || 0) + '</div><div class="stat-label">Cost</div>' +
     '<div class="stat-detail">' +
-    '<div class="row"><span class="label">Input</span><span>' + fmtCostPrecise(cost.input || 0) + '</span></div>' +
-    '<div class="row"><span class="label">Output</span><span>' + fmtCostPrecise(cost.output || 0) + '</span></div>' +
-    '<div class="row"><span class="label">Cache</span><span>' + fmtCostPrecise(cost.cacheRead || 0) + '</span></div>' +
+    '<div class="row"><span class="label">Input</span><span>' + fmtCost(cost.input || 0) + '</span></div>' +
+    '<div class="row"><span class="label">Output</span><span>' + fmtCost(cost.output || 0) + '</span></div>' +
+    '<div class="row"><span class="label">Cache</span><span>' + fmtCost(cost.cacheRead || 0) + '</span></div>' +
     '</div></div>' +
     '<div class="stat"><div class="stat-value">' + fmtTokens(totalTokens) + '</div><div class="stat-label">Tokens</div></div>' +
     '<div class="stat"><div class="stat-value">' + (t.llmCalls || 0) + '</div><div class="stat-label">LLM Calls</div></div>' +

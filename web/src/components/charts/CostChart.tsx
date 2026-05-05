@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { formatShortDate } from "../../lib/format";
+import { formatShortDate, formatUsd } from "../../lib/format";
 
 interface CostBreakdown {
   input: number;
@@ -34,11 +34,6 @@ const LABELS: Record<string, string> = {
   cacheWrite: "Cache write",
 };
 
-function formatUsd(n: number): string {
-  if (n < 0.01 && n > 0) return `$${(n * 100).toFixed(2)}c`;
-  return `$${n.toFixed(4)}`;
-}
-
 export function CostChart({ data }: CostChartProps) {
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
 
@@ -65,9 +60,14 @@ export function CostChart({ data }: CostChartProps) {
   const barWidth = Math.min(Math.floor(chartWidth / data.length) - 2, 40);
   const gap = (chartWidth - barWidth * data.length) / (data.length + 1);
 
-  // Y-axis ticks
+  // Y-axis ticks. Pick the unit once per axis based on maxCost so all ticks
+  // share a unit — formatUsd decides per-value, which would mix $ and ¢ on
+  // the same axis when the scale is sub-penny.
   const yTicks = 4;
   const yStep = maxCost / yTicks;
+  const axisInCents = maxCost < 0.01;
+  const formatTick = (value: number) =>
+    axisInCents ? `${(value * 100).toFixed(2)}¢` : `$${value.toFixed(2)}`;
 
   const segments: Array<{ key: keyof typeof COLORS; field: keyof CostBreakdown }> = [
     { key: "cacheWrite", field: "cacheWrite" },
@@ -114,7 +114,7 @@ export function CostChart({ data }: CostChartProps) {
                 className="fill-muted-foreground"
                 style={{ fontSize: 10 }}
               >
-                ${value < 0.01 ? value.toFixed(3) : value.toFixed(2)}
+                {formatTick(value)}
               </text>
             </g>
           );
