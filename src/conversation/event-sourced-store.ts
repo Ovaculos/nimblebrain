@@ -364,8 +364,15 @@ export class EventSourcedConversationStore implements ConversationStore, EventSi
       newConv.updatedAt =
         messagesToCopy[messagesToCopy.length - 1]?.timestamp ?? new Date().toISOString();
 
-      // Write as event-format: convert messages to events
+      // Write as event-format: convert messages to events.
+      //
+      // Each assistant turn must be wrapped in a synthetic
+      // run.start/run.done span — without it, reconstructMessages drops
+      // the turn (see event-reconstructor.ts: assistant messages are
+      // only emitted inside an active run scope). Pre-fix, history() on
+      // a forked event-format conversation returned only user messages.
       const eventLines: string[] = [];
+      let runCounter = 0;
       for (const msg of messagesToCopy) {
         if (msg.role === "user") {
           eventLines.push(
@@ -377,15 +384,27 @@ export class EventSourcedConversationStore implements ConversationStore, EventSi
             }),
           );
         } else if (msg.role === "assistant") {
+          const runId = `forked-${runCounter++}`;
+          const model = msg.metadata?.model ?? "unknown";
+          eventLines.push(JSON.stringify({ ts: msg.timestamp, type: "run.start", runId, model }));
           eventLines.push(
             JSON.stringify({
               ts: msg.timestamp,
               type: "llm.response",
-              runId: "forked",
-              model: msg.metadata?.model ?? "unknown",
+              runId,
+              model,
               content: msg.content,
               usage: msg.metadata?.usage ?? { inputTokens: 0, outputTokens: 0 },
               llmMs: msg.metadata?.llmMs ?? 0,
+            }),
+          );
+          eventLines.push(
+            JSON.stringify({
+              ts: msg.timestamp,
+              type: "run.done",
+              runId,
+              stopReason: "complete",
+              totalMs: msg.metadata?.llmMs ?? 0,
             }),
           );
         }

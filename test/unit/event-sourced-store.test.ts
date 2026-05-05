@@ -511,4 +511,62 @@ describe("EventSourcedConversationStore", () => {
     expect(loaded!.visibility).toBe("shared");
     expect(loaded!.participants).toEqual(["user-1", "user-2"]);
   });
+
+  it("fork() preserves assistant turns through history() round-trip", async () => {
+    // Regression: fork() previously wrote llm.response events without
+    // run.start/run.done bookends. The reconstructor only emits assistant
+    // messages inside an active run scope, so history() on a forked
+    // event-format conversation returned only the user turns. Assistant
+    // turns silently disappeared.
+    const conv = await store.create();
+    store.setActiveConversation(conv.id);
+
+    store.emit({ type: "run.start", data: { runId: "r1", model: "test-model" } });
+    store.emit({
+      type: "llm.done",
+      data: {
+        runId: "r1",
+        model: "test-model",
+        content: [{ type: "text", text: "First reply" }],
+        usage: { inputTokens: 10, outputTokens: 5 },
+        llmMs: 50,
+      },
+    });
+    store.emit({ type: "run.done", data: { runId: "r1", stopReason: "complete", totalMs: 50 } });
+
+    store.appendEvent(conv.id, {
+      ts: new Date().toISOString(),
+      type: "user.message",
+      content: [{ type: "text", text: "Follow up" }],
+    } as ConversationEvent);
+
+    store.emit({ type: "run.start", data: { runId: "r2", model: "test-model" } });
+    store.emit({
+      type: "llm.done",
+      data: {
+        runId: "r2",
+        model: "test-model",
+        content: [{ type: "text", text: "Second reply" }],
+        usage: { inputTokens: 20, outputTokens: 8 },
+        llmMs: 75,
+      },
+    });
+    store.emit({ type: "run.done", data: { runId: "r2", stopReason: "complete", totalMs: 75 } });
+
+    const sourceMessages = await store.history(conv);
+    const sourceAssistantCount = sourceMessages.filter((m) => m.role === "assistant").length;
+
+    const forked = await store.fork(conv.id);
+    expect(forked).not.toBeNull();
+    expect(forked!.id).not.toBe(conv.id);
+
+    const forkedMessages = await store.history(forked!);
+    const forkedAssistantCount = forkedMessages.filter((m) => m.role === "assistant").length;
+
+    // Forked conversation must have the same number of assistant turns
+    // as the source. Without the synthetic run.start/run.done bookends
+    // around each forked llm.response, this would be 0.
+    expect(forkedAssistantCount).toBe(sourceAssistantCount);
+    expect(forkedAssistantCount).toBeGreaterThan(0);
+  });
 });
