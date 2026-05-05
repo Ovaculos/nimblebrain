@@ -122,7 +122,7 @@ function mapResultToRun(
     inputTokens: data.usage.inputTokens,
     outputTokens: data.usage.outputTokens,
     toolCalls: Array.isArray(data.toolCalls) ? data.toolCalls.length : 0,
-    iterations: data.usage?.iterations ?? 0,
+    iterations: data.usage.iterations,
     resultPreview: data.response ? data.response.slice(0, 500) : undefined,
     stopReason,
   };

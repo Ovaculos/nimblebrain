@@ -38,7 +38,8 @@ interface ModelUsage {
 }
 
 interface UsageReport {
-  period: { start: string; end: string };
+  // Mirrors UsageReport.period from src/conversation/usage-aggregator.ts.
+  period: { from: string; to: string };
   totals: {
     tokens: TokenBreakdown;
     cost: CostBreakdown;

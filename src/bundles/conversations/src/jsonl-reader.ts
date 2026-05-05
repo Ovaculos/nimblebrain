@@ -94,6 +94,15 @@ export interface DisplayUsage {
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens?: number;
+  /**
+   * Cache-write and reasoning subtotals carried through so fork() can
+   * round-trip them onto the new file. The chat UI doesn't currently
+   * render these per-message, but losing them here means a forked
+   * conversation would silently report lower cost than the original on
+   * cache-heavy or reasoning-heavy turns.
+   */
+  cacheWriteTokens?: number;
+  reasoningTokens?: number;
   /** Model of the last LLM call in the run (runs can switch models mid-turn). */
   model: string;
   llmMs: number;
@@ -474,7 +483,11 @@ function collectRun(
   let inputTokens = 0;
   let outputTokens = 0;
   let cacheReadTokens = 0;
+  let cacheWriteTokens = 0;
+  let reasoningTokens = 0;
   let hasCacheReads = false;
+  let hasCacheWrites = false;
+  let hasReasoning = false;
   let llmMs = 0;
   let model = "";
 
@@ -525,13 +538,25 @@ function collectRun(
 
     // Usage — aggregate across all llm.responses in the run. `usage` is
     // optional on the wire (absent on pre-unification legacy events); the
-    // run-level total just contributes zero in that case.
+    // run-level total just contributes zero in that case. cacheWrite and
+    // reasoning are carried so fork() can round-trip them; the chat UI
+    // doesn't render them per-message today.
     inputTokens += llm.usage?.inputTokens ?? 0;
     outputTokens += llm.usage?.outputTokens ?? 0;
     const llmCacheRead = llm.usage?.cacheReadTokens ?? 0;
     if (llmCacheRead > 0) {
       hasCacheReads = true;
       cacheReadTokens += llmCacheRead;
+    }
+    const llmCacheWrite = llm.usage?.cacheWriteTokens ?? 0;
+    if (llmCacheWrite > 0) {
+      hasCacheWrites = true;
+      cacheWriteTokens += llmCacheWrite;
+    }
+    const llmReasoning = llm.usage?.reasoningTokens ?? 0;
+    if (llmReasoning > 0) {
+      hasReasoning = true;
+      reasoningTokens += llmReasoning;
     }
     llmMs += llm.llmMs;
     model = llm.model;
@@ -546,6 +571,8 @@ function collectRun(
     inputTokens,
     outputTokens,
     ...(hasCacheReads ? { cacheReadTokens } : {}),
+    ...(hasCacheWrites ? { cacheWriteTokens } : {}),
+    ...(hasReasoning ? { reasoningTokens } : {}),
     model,
     llmMs,
   };
@@ -699,6 +726,12 @@ function buildLegacyUsageFromMetadata(metadata: Record<string, unknown>): Displa
     outputTokens: usage.outputTokens,
     ...(typeof usage.cacheReadTokens === "number"
       ? { cacheReadTokens: usage.cacheReadTokens }
+      : {}),
+    ...(typeof usage.cacheWriteTokens === "number"
+      ? { cacheWriteTokens: usage.cacheWriteTokens }
+      : {}),
+    ...(typeof usage.reasoningTokens === "number"
+      ? { reasoningTokens: usage.reasoningTokens }
       : {}),
     model: typeof metadata.model === "string" ? metadata.model : "unknown",
     llmMs: typeof metadata.llmMs === "number" ? metadata.llmMs : 0,

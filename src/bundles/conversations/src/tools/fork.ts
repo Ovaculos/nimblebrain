@@ -100,6 +100,12 @@ export async function handleFork(input: ForkInput, index: ConversationIndex): Pr
         ...(msg.usage.cacheReadTokens !== undefined
           ? { cacheReadTokens: msg.usage.cacheReadTokens }
           : {}),
+        ...(msg.usage.cacheWriteTokens !== undefined
+          ? { cacheWriteTokens: msg.usage.cacheWriteTokens }
+          : {}),
+        ...(msg.usage.reasoningTokens !== undefined
+          ? { reasoningTokens: msg.usage.reasoningTokens }
+          : {}),
       };
       metadata.model = msg.usage.model;
       metadata.llmMs = msg.usage.llmMs;
