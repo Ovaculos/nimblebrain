@@ -96,9 +96,9 @@ export function estimateCost(modelString: string, usage: TokenUsage): number {
   return costBreakdown(modelString, usage).total;
 }
 
-/** Format USD cost for display. Sub-penny values shown as cents. */
+/** Format USD cost for display. Sub-penny non-zero values shown as cents; zero is "$0.00". */
 export function formatCost(usd: number): string {
-  if (usd < 0.01) return `${(usd * 100).toFixed(2)}¢`;
+  if (usd > 0 && usd < 0.01) return `${(usd * 100).toFixed(2)}¢`;
   return `$${usd.toFixed(2)}`;
 }
 

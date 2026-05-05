@@ -6,8 +6,8 @@ describe("formatCost", () => {
     expect(formatCost(0.005)).toBe("0.50¢");
   });
 
-  it("formats zero as cents", () => {
-    expect(formatCost(0)).toBe("0.00¢");
+  it("formats zero as $0.00 (no activity, not 'zero cents')", () => {
+    expect(formatCost(0)).toBe("$0.00");
   });
 
   it("formats dollar values with two decimals", () => {

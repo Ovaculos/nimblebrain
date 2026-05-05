@@ -60,9 +60,14 @@ export function CostChart({ data }: CostChartProps) {
   const barWidth = Math.min(Math.floor(chartWidth / data.length) - 2, 40);
   const gap = (chartWidth - barWidth * data.length) / (data.length + 1);
 
-  // Y-axis ticks
+  // Y-axis ticks. Pick the unit once per axis based on maxCost so all ticks
+  // share a unit — formatUsd decides per-value, which would mix $ and ¢ on
+  // the same axis when the scale is sub-penny.
   const yTicks = 4;
   const yStep = maxCost / yTicks;
+  const axisInCents = maxCost < 0.01;
+  const formatTick = (value: number) =>
+    axisInCents ? `${(value * 100).toFixed(2)}¢` : `$${value.toFixed(2)}`;
 
   const segments: Array<{ key: keyof typeof COLORS; field: keyof CostBreakdown }> = [
     { key: "cacheWrite", field: "cacheWrite" },
@@ -109,7 +114,7 @@ export function CostChart({ data }: CostChartProps) {
                 className="fill-muted-foreground"
                 style={{ fontSize: 10 }}
               >
-                {formatUsd(value)}
+                {formatTick(value)}
               </text>
             </g>
           );
