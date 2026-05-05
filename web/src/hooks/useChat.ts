@@ -431,6 +431,8 @@ export function useChat(initialConversationId?: string, currentUserId?: string):
                     inputTokens: result.usage.inputTokens,
                     outputTokens: result.usage.outputTokens,
                     cacheReadTokens: result.usage.cacheReadTokens,
+                    cacheWriteTokens: result.usage.cacheWriteTokens,
+                    reasoningTokens: result.usage.reasoningTokens,
                     model: result.usage.model,
                     llmMs: result.usage.llmMs,
                   }
@@ -730,6 +732,8 @@ export function useChat(initialConversationId?: string, currentUserId?: string):
                 inputTokens: result.usage.inputTokens,
                 outputTokens: result.usage.outputTokens,
                 cacheReadTokens: result.usage.cacheReadTokens,
+                cacheWriteTokens: result.usage.cacheWriteTokens,
+                reasoningTokens: result.usage.reasoningTokens,
                 model: result.usage.model,
                 llmMs: result.usage.llmMs,
               }
