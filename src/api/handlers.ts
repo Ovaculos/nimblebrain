@@ -1,4 +1,6 @@
-import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { validateMcpb } from "@nimblebrain/mpak-sdk";
 import { CallbackEventSink } from "../adapters/callback-events.ts";
@@ -1438,27 +1440,61 @@ export async function handleBundleUpload(
     return apiError(400, "bad_request", "Uploaded file is empty");
   }
 
-  // Save to workspace bundles directory
+  // Validate-then-commit:
+  //
+  // Write the upload to a tempfile under the OS temp dir first, run
+  // `validateMcpb` against it, and only `rename` into the workspace bundles
+  // dir on success. The previous order (write into the bundles dir, then
+  // validate, then unlink on failure) leaked partially-trusted artifacts:
+  // if unlink failed (perm/race) or the process crashed between write and
+  // unlink, an unvalidated `.mcpb` lingered in the bundles dir — a stale
+  // file the install path could later spawn. Tempfile + rename keeps the
+  // bundles dir to validated content only.
   const bundlesDir = join(runtime.getWorkspaceScopedDir(workspaceId), "bundles");
   mkdirSync(bundlesDir, { recursive: true });
 
   const safeName = safeBundleFilename(filename);
+  const tempPath = join(tmpdir(), `nb-mcpb-${randomBytes(8).toString("hex")}.mcpb`);
   const bundlePath = join(bundlesDir, safeName);
-  writeFileSync(bundlePath, data, { mode: 0o600 });
 
-  // Validate via mpak SDK
-  const result = await validateMcpb(bundlePath);
+  writeFileSync(tempPath, data, { mode: 0o600 });
+
+  let result: Awaited<ReturnType<typeof validateMcpb>>;
+  try {
+    result = await validateMcpb(tempPath);
+  } catch (err) {
+    try {
+      unlinkSync(tempPath);
+    } catch {
+      // best-effort cleanup
+    }
+    throw err;
+  }
 
   if (!result.valid) {
-    // Clean up invalid bundle
     try {
-      unlinkSync(bundlePath);
+      unlinkSync(tempPath);
     } catch {
       // best-effort cleanup
     }
     return apiError(400, "invalid_bundle", "Bundle validation failed", {
       errors: result.errors,
     });
+  }
+
+  // Validation passed — promote tempfile into the workspace bundles dir.
+  // `renameSync` is atomic when source and destination share a filesystem;
+  // when they don't (tmpdir on a separate fs), Node falls back to copy +
+  // unlink, which is good enough — we already hold a valid archive.
+  try {
+    renameSync(tempPath, bundlePath);
+  } catch (err) {
+    try {
+      unlinkSync(tempPath);
+    } catch {
+      // best-effort cleanup
+    }
+    throw err;
   }
 
   return json({
