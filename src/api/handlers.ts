@@ -1398,7 +1398,11 @@ export async function handleBundleUpload(
   runtime: Runtime,
   workspaceId: string,
 ): Promise<Response> {
-  let formData: FormData;
+  // Inferred type rather than `FormData` annotation — Bun's Request.formData()
+  // returns the undici FormData, which has incompatible iterator types with
+  // the DOM-lib `FormData` resolved at the annotation site. They're shape-
+  // compatible at runtime; let TS infer to avoid the cross-type assignment.
+  let formData: Awaited<ReturnType<typeof raw.formData>>;
   try {
     formData = await raw.formData();
   } catch {
