@@ -21,6 +21,7 @@ import { filterEnvForBundle } from "./env-filter.ts";
 import { validateManifest } from "./manifest.ts";
 import { getMpak } from "./mpak.ts";
 import {
+  assertPathInWorkspaceBundlesDir,
   deriveBundleDataDir,
   deriveServerName,
   resolveBundleDataDir,
@@ -505,6 +506,13 @@ export async function startBundleSource(
     }
 
     const nbWorkDir = opts.workDir ?? process.env.NB_WORK_DIR ?? join(homedir(), ".nimblebrain");
+
+    // Defense-in-depth: re-check at re-hydration that the persisted path
+    // still lives inside the workspace bundles dir. The install-side guard
+    // in `manage_app` is the primary control; this catches a tampered or
+    // out-of-band-edited `workspace.json`.
+    assertPathInWorkspaceBundlesDir(ref.path, nbWorkDir, opts.wsId);
+
     const mpakHome = process.env.MPAK_HOME ?? join(homedir(), ".mpak");
     const mpak = getMpak(mpakHome);
 

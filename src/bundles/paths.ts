@@ -1,4 +1,5 @@
-import { join } from "node:path";
+import { existsSync, realpathSync } from "node:fs";
+import { join, resolve, sep } from "node:path";
 import type { BundleRef } from "./types.ts";
 
 /** Prefixes reserved for system tools — bundles must not use these as source names. */
@@ -101,4 +102,51 @@ export function deriveBundleDataDir(name: string): string {
  */
 export function resolveBundleDataDir(workspacePath: string, bundleName: string): string {
   return join(workspacePath, "data", deriveBundleDataDir(bundleName));
+}
+
+/**
+ * Resolve the absolute on-disk path of the workspace bundles directory —
+ * the only location an LLM-supplied `.mcpb` path is permitted to reference.
+ */
+export function resolveWorkspaceBundlesDir(workDir: string, wsId: string): string {
+  return join(workDir, "workspaces", wsId, "bundles");
+}
+
+/**
+ * Assert that `filePath` resolves inside `<workDir>/workspaces/<wsId>/bundles/`.
+ * Throws otherwise.
+ *
+ * Critical defense for the `manage_app({ path })` tool path. Without this
+ * guard, prompt-injected agent input can install any `.mcpb` the platform
+ * user can read — the spawned subprocess inherits workspace credentials and
+ * (for protected bundles) `NB_INTERNAL_TOKEN`. The same check runs at
+ * startup re-hydration so a tampered `workspace.json` cannot escape either.
+ *
+ * Both sides are realpath'd when possible so symlinks pointing outside the
+ * bundles dir are rejected. If the file does not exist (uninstall after
+ * manual deletion), falls back to a lexical resolve — workspace.json is
+ * written by trusted code, so a missing file is not a sign of tampering.
+ */
+export function assertPathInWorkspaceBundlesDir(
+  filePath: string,
+  workDir: string,
+  wsId: string,
+): void {
+  const bundlesDir = resolveWorkspaceBundlesDir(workDir, wsId);
+  // Realpath the bundles dir if it exists; otherwise fall back to a lexical
+  // resolve. The dir is created on first upload, so a missing dir means no
+  // bundle could possibly live inside it — a guard violation either way.
+  const canonicalBundlesDir = existsSync(bundlesDir)
+    ? realpathSync(bundlesDir)
+    : resolve(bundlesDir);
+  const canonicalFile = existsSync(filePath) ? realpathSync(filePath) : resolve(filePath);
+  if (
+    canonicalFile !== canonicalBundlesDir &&
+    !canonicalFile.startsWith(canonicalBundlesDir + sep)
+  ) {
+    throw new Error(
+      `Bundle path must live inside the workspace bundles directory ` +
+        `(${canonicalBundlesDir}); got ${canonicalFile}`,
+    );
+  }
 }

@@ -1,7 +1,7 @@
 import { NoopEventSink } from "../adapters/noop-events.ts";
 import type { BundleLifecycleManager } from "../bundles/lifecycle.ts";
 import { getMpak } from "../bundles/mpak.ts";
-import { deriveServerName } from "../bundles/paths.ts";
+import { assertPathInWorkspaceBundlesDir, deriveServerName } from "../bundles/paths.ts";
 import { startBundleSource } from "../bundles/startup.ts";
 import type { BundleManifest } from "../bundles/types.ts";
 import {
@@ -841,6 +841,24 @@ async function installBundleInWorkspaceViaCtx(
   ctx: ManageBundleContext,
 ): Promise<ToolResult> {
   const label = target.name ?? target.path!;
+
+  // Confine LLM-supplied `path` to the workspace bundles dir — see
+  // `assertPathInWorkspaceBundlesDir`. Reject before constructing the ref so
+  // a malicious path never reaches `startBundleSource` (which would spawn a
+  // subprocess with workspace credentials).
+  if (target.path) {
+    try {
+      assertPathInWorkspaceBundlesDir(target.path, ctx.workDir, wsId);
+    } catch (err) {
+      return {
+        content: textContent(
+          `Failed to install ${label} in workspace ${wsId}: ${err instanceof Error ? err.message : String(err)}`,
+        ),
+        isError: true,
+      };
+    }
+  }
+
   const bundleRef = (
     target.name ? { name: target.name } : { path: target.path! }
   ) as import("../bundles/types.ts").BundleRef;
@@ -955,6 +973,25 @@ async function uninstallBundleFromWorkspaceViaCtx(
   ctx: ManageBundleContext,
 ): Promise<ToolResult> {
   const label = target.name ?? target.path!;
+
+  // Mirror the install-side guard. An attacker who can poison the agent's
+  // tool input could otherwise pass an arbitrary `path` to read its manifest
+  // (validateMcpb extracts and parses the archive). Confining to the
+  // workspace bundles dir bounds the surface to artifacts the workspace
+  // already accepted via upload.
+  if (target.path) {
+    try {
+      assertPathInWorkspaceBundlesDir(target.path, ctx.workDir, wsId);
+    } catch (err) {
+      return {
+        content: textContent(
+          `Failed to uninstall ${label} from workspace ${wsId}: ${err instanceof Error ? err.message : String(err)}`,
+        ),
+        isError: true,
+      };
+    }
+  }
+
   try {
     // Resolve the bundle name. For .mcpb path uninstalls the manifest name
     // lives inside the archive — peek via validateMcpb so the downstream
