@@ -62,7 +62,23 @@ export function AboutTab() {
   const [apps, setApps] = useState<AppInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [bundlesError, setBundlesError] = useState<string | null>(null);
-  const [uploadStatus, setUploadStatus] = useState<string | null>(null);
+  // Two pieces of upload state, separated:
+  //
+  //   uploadPhase  — what the upload is doing right now ("validating" /
+  //                  "installing" / "idle"). Drives the button label and
+  //                  the disabled state. `isUploading` is derived from it.
+  //   uploadError  — error message to surface in the inline-error panel.
+  //                  Independent so we can show "validation failed" without
+  //                  string-equality-checking the phase.
+  //
+  // Previous shape used a single `uploadStatus: string | null` that doubled
+  // as both phase indicator and error message, requiring string-equality
+  // checks ("Validating..." / "Installing...") to decide whether the button
+  // should be disabled. That coupled the UI to specific status copy and
+  // would silently break if the strings were ever changed.
+  const [uploadPhase, setUploadPhase] = useState<"idle" | "validating" | "installing">("idle");
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const isUploading = uploadPhase !== "idle";
   const fileRef = useRef<HTMLInputElement>(null);
 
   const fetchApps = useCallback(async () => {
@@ -87,13 +103,14 @@ export function AboutTab() {
   const handleUpload = useCallback(
     async (file: File) => {
       if (!file.name.endsWith(".mcpb")) {
-        setUploadStatus("File must have .mcpb extension");
+        setUploadError("File must have .mcpb extension");
         return;
       }
-      setUploadStatus("Validating...");
+      setUploadError(null);
+      setUploadPhase("validating");
       try {
         const result = await uploadBundle(file);
-        setUploadStatus("Installing...");
+        setUploadPhase("installing");
         const installResult = await callTool("nb", "manage_app", {
           action: "install",
           path: result.path,
@@ -104,14 +121,15 @@ export function AboutTab() {
               ?.filter((c: { type: string }) => c.type === "text")
               .map((c: { text: string }) => c.text)
               .join("") ?? "Install failed";
-          setUploadStatus(msg);
+          setUploadError(msg);
           return;
         }
-        setUploadStatus(null);
         setLoading(true);
         fetchApps();
       } catch (err: unknown) {
-        setUploadStatus(err instanceof Error ? err.message : String(err));
+        setUploadError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setUploadPhase("idle");
       }
     },
     [fetchApps],
@@ -150,12 +168,14 @@ export function AboutTab() {
               variant="outline"
               size="sm"
               onClick={() => fileRef.current?.click()}
-              disabled={uploadStatus === "Validating..." || uploadStatus === "Installing..."}
+              disabled={isUploading}
             >
               <Upload className="mr-1 h-3.5 w-3.5" />
-              {uploadStatus === "Validating..." || uploadStatus === "Installing..."
-                ? uploadStatus
-                : "Upload"}
+              {uploadPhase === "validating"
+                ? "Validating..."
+                : uploadPhase === "installing"
+                  ? "Installing..."
+                  : "Upload"}
             </Button>
           </>
         }
@@ -170,11 +190,11 @@ export function AboutTab() {
           </Link>
           .
         </p>
-        {uploadStatus && uploadStatus !== "Validating..." && uploadStatus !== "Installing..." ? (
+        {uploadError ? (
           <InlineError
-            message={uploadStatus}
+            message={uploadError}
             action={
-              <Button variant="outline" size="sm" onClick={() => setUploadStatus(null)}>
+              <Button variant="outline" size="sm" onClick={() => setUploadError(null)}>
                 Dismiss
               </Button>
             }
