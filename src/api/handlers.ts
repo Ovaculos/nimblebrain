@@ -1,5 +1,6 @@
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
+import { validateMcpb } from "@nimblebrain/mpak-sdk";
 import { CallbackEventSink } from "../adapters/callback-events.ts";
 import { log } from "../cli/log.ts";
 import { isToolEnabled, isToolVisibleToRole, type ResolvedFeatures } from "../config/features.ts";
@@ -1438,23 +1439,18 @@ export async function handleBundleUpload(
   }
 
   // Save to workspace bundles directory
-  const { mkdirSync, writeFileSync } = await import("node:fs");
-  const { join: joinPath } = await import("node:path");
-
-  const bundlesDir = joinPath(runtime.getWorkspaceScopedDir(workspaceId), "bundles");
+  const bundlesDir = join(runtime.getWorkspaceScopedDir(workspaceId), "bundles");
   mkdirSync(bundlesDir, { recursive: true });
 
   const safeName = safeBundleFilename(filename);
-  const bundlePath = joinPath(bundlesDir, safeName);
+  const bundlePath = join(bundlesDir, safeName);
   writeFileSync(bundlePath, data, { mode: 0o600 });
 
   // Validate via mpak SDK
-  const { validateMcpb } = await import("@nimblebrain/mpak-sdk");
   const result = await validateMcpb(bundlePath);
 
   if (!result.valid) {
     // Clean up invalid bundle
-    const { unlinkSync } = await import("node:fs");
     try {
       unlinkSync(bundlePath);
     } catch {
