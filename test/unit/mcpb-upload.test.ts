@@ -432,27 +432,49 @@ describe("Fix 5 (continued): protected .mcpb gets internalEnv", () => {
 // The duplicate check uses the wrong name → silent collision.
 // ---------------------------------------------------------------------------
 
-describe("Fix 6: .mcpb server name must come from manifest, not file path", () => {
-	it("path-derived name must equal manifest-derived name for .mcpb", () => {
-		// serverNameFromRef({path: "/uploads/echo.mcpb"}) calls
-		// deriveServerName("/uploads/echo.mcpb")
-		const pathDerived = deriveServerName("/uploads/echo.mcpb");
-
-		// startBundleSource registers under deriveServerName(manifest.name)
-		// where manifest.name = "echo"
-		const manifestDerived = deriveServerName("echo");
-
-		// CORRECT: these must be equal so the duplicate check works
-		// Currently: pathDerived = "echo-mcpb", manifestDerived = "echo"
-		expect(pathDerived).toBe(manifestDerived);
+describe("Fix 6: install for .mcpb registers under manifest name, not path", () => {
+	beforeEach(() => {
+		capturedSpawnEnv = undefined;
+		mkdirSync(tmpCwd, { recursive: true });
+		writeFileSync(join(tmpCwd, "manifest.json"), JSON.stringify(testManifest));
 	});
 
-	it("scoped name path-derived must equal manifest-derived", () => {
-		const pathDerived = deriveServerName("/uploads/@acme/my-tool.mcpb");
-		const manifestDerived = deriveServerName("my-tool");
+	afterEach(() => {
+		rmSync(tmpCwd, { recursive: true, force: true });
+	});
 
-		// Both should resolve to "my-tool"
-		expect(pathDerived).toBe(manifestDerived);
+	it("install with .mcpb path returns manifest-derived sourceName", async () => {
+		const { installBundleInWorkspace } = await import(
+			"../../src/bundles/workspace-ops.ts"
+		);
+		const { ToolRegistry } = await import("../../src/tools/registry.ts");
+		const { NoopEventSink } = await import("../../src/adapters/noop-events.ts");
+
+		const registry = new ToolRegistry();
+		const sink = new NoopEventSink();
+
+		// Pre-register a source under the WRONG (path-derived) name to prove
+		// the install pre-flight check no longer trips on it. With the bug,
+		// installBundleInWorkspace would compute `deriveServerName(path)` =
+		// "echo-mcpb", see no collision, then startBundleSource would try to
+		// register "echo" — the addSource throws but the pre-flight check
+		// failed to predict the right name.
+		const pathDerivedWrongName = deriveServerName("/uploads/echo.mcpb");
+		expect(pathDerivedWrongName).not.toBe("echo"); // sanity: they differ
+
+		const result = await installBundleInWorkspace(
+			"ws_test",
+			{ path: "/uploads/echo.mcpb" },
+			registry,
+			sink,
+			undefined,
+			{ workDir: "/tmp/nb-workdir" },
+		);
+
+		// CORRECT: registered under manifest name, not path-derived name
+		expect(result.serverName).toBe("echo");
+		expect(registry.hasSource("echo")).toBe(true);
+		expect(registry.hasSource(pathDerivedWrongName)).toBe(false);
 	});
 });
 
