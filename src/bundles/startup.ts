@@ -486,34 +486,92 @@ export async function startBundleSource(
       eventSink,
     );
   } else if ("path" in ref && ref.path.endsWith(".mcpb")) {
-    // .mcpb archive — use the SDK to extract and prepare
-    const mpakHome = process.env.MPAK_HOME ?? join(homedir(), ".mpak");
-    const mpak = getMpak(mpakHome);
-    const nbWorkDir = opts?.workDir ?? process.env.NB_WORK_DIR ?? join(homedir(), ".nimblebrain");
-
-    const server = await mpak.prepareServer(
-      { local: ref.path },
-      { workspaceDir: opts?.dataDir ?? nbWorkDir },
-    );
-
-    const serverName = deriveServerName(server.name);
-    validateServerName(serverName);
-
-    // Read manifest from the extracted cache dir
-    const manifestPath = join(server.cwd, "manifest.json");
-    const rawManifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
-    const manifestResult = validateManifest(rawManifest);
-    if (manifestResult.valid && manifestResult.manifest) {
-      manifest = manifestResult.manifest;
-      meta = extractBundleMeta(rawManifest);
+    // .mcpb archive — peek manifest, resolve workspace credentials, then prepare.
+    //
+    // The original implementation diverged from the named-bundle branch in
+    // three ways: it skipped resolveUserConfig (so workspace-stored API keys
+    // never reached the subprocess), it computed serverName from the file
+    // path (so duplicate checks and lifecycle lookups missed the
+    // manifest-derived name the bundle was actually registered under), and
+    // it omitted MPAK_WORKSPACE / UPJACK_ROOT / internalEnv from the spawn
+    // env (so Upjack data writes landed in the wrong dir and protected
+    // bundles couldn't reach the host). This branch now mirrors the named
+    // path one-for-one, with the manifest peeked from the .mcpb archive
+    // instead of read from the mpak cache.
+    if (!opts?.wsId) {
+      throw new Error(
+        `Cannot start ${ref.path}: a workspace ID is required (.mcpb credentials are workspace-scoped).`,
+      );
     }
 
+    const nbWorkDir = opts.workDir ?? process.env.NB_WORK_DIR ?? join(homedir(), ".nimblebrain");
+    const mpakHome = process.env.MPAK_HOME ?? join(homedir(), ".mpak");
+    const mpak = getMpak(mpakHome);
+
+    // Peek manifest BEFORE prepareServer so we can resolve user_config and
+    // derive serverName from manifest content. validateMcpb extracts to its
+    // own temp dir and cleans up; prepareServer extracts again into the mpak
+    // cache. Double extraction is acceptable — archives are bounded in size
+    // and this only runs at startup.
+    const { validateMcpb } = await import("@nimblebrain/mpak-sdk");
+    const validation = await validateMcpb(ref.path);
+    if (!validation.valid || !validation.manifest) {
+      throw new Error(
+        `Invalid .mcpb bundle at ${ref.path}: ${validation.errors?.join(", ") ?? "manifest validation failed"}`,
+      );
+    }
+    const peekedManifest = validation.manifest as BundleManifest;
+    manifest = peekedManifest;
+    meta = extractBundleMeta(peekedManifest as unknown as Record<string, unknown>);
+
+    const serverName = deriveServerName(peekedManifest.name);
+    validateServerName(serverName);
+
+    // Data dir derives from manifest name + wsId — matches the named-bundle
+    // convention so re-uploads of the same bundle land in the same dir
+    // across restarts. opts.dataDir override only used by tests.
+    const bundleDataDir =
+      opts.dataDir ??
+      resolveBundleDataDir(join(nbWorkDir, "workspaces", opts.wsId), peekedManifest.name);
+
+    const userConfig = await resolveUserConfig({
+      bundleName: peekedManifest.name,
+      userConfigSchema: peekedManifest.user_config,
+      wsId: opts.wsId,
+      workDir: nbWorkDir,
+    });
+
+    let server: Awaited<ReturnType<typeof mpak.prepareServer>>;
+    try {
+      server = await mpak.prepareServer(
+        { local: ref.path },
+        { workspaceDir: bundleDataDir, userConfig },
+      );
+    } catch (err) {
+      throw friendlyMpakConfigError(err, opts.wsId);
+    }
+
+    const internalEnv = ref.protected && opts?.internalEnv ? opts.internalEnv : undefined;
+
     const platformEnv = buildPlatformEnv({
-      workspaceId: opts?.wsId,
+      workspaceId: opts.wsId,
       serverName,
-      manifestMeta: (manifest?._meta ?? undefined) as Record<string, unknown> | undefined,
+      manifestMeta: peekedManifest._meta as Record<string, unknown> | undefined,
       publicOrigin: resolvePublicOrigin(),
     });
+
+    const spawnEnv: Record<string, string> = {
+      ...server.env,
+      ...filterEnvForBundle(process.env as Record<string, string>, undefined, ref.allowedEnv),
+      ...(ref.env ?? {}),
+      MPAK_WORKSPACE: bundleDataDir,
+      UPJACK_ROOT: bundleDataDir,
+      ...platformEnv,
+    };
+    if (internalEnv) {
+      spawnEnv.NB_INTERNAL_TOKEN = internalEnv.NB_INTERNAL_TOKEN;
+      spawnEnv.NB_HOST_URL = internalEnv.NB_HOST_URL;
+    }
 
     source = new McpSource(
       serverName,
@@ -522,12 +580,7 @@ export async function startBundleSource(
         spawn: {
           command: server.command,
           args: server.args,
-          env: {
-            ...server.env,
-            ...filterEnvForBundle(process.env as Record<string, string>, undefined, ref.allowedEnv),
-            ...(ref.env ?? {}),
-            ...platformEnv,
-          },
+          env: spawnEnv,
           cwd: server.cwd,
         },
       },

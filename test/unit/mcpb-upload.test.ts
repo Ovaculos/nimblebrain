@@ -162,6 +162,16 @@ let capturedResolveUserConfigOpts:
 	| undefined;
 let capturedPrepareServerOpts: { workspaceDir: string; userConfig?: unknown } | undefined;
 
+// validateMcpb ships in mpak-sdk@>=0.7.0 (mpak#94). Until that version is
+// published + dep-bumped, mock it here so the .mcpb branch is testable.
+mock.module("@nimblebrain/mpak-sdk", () => ({
+	validateMcpb: async (_path: string) => ({
+		valid: true,
+		manifest: testManifest,
+		errors: [],
+	}),
+}));
+
 mock.module("../../src/config/workspace-credentials.ts", () => ({
 	resolveUserConfig: async (opts: {
 		bundleName: string;
