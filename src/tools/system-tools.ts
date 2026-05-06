@@ -51,6 +51,38 @@ export interface ManageBundleContext {
 export type GetSkillsFn = () => { context: Skill[]; matchable: Skill[] };
 
 /**
+ * Target identifier used by the manage_app install/uninstall flow — exactly
+ * one of `name` / `path` is expected to be set at the call site.
+ */
+export interface BundleTarget {
+  name?: string;
+  path?: string;
+}
+
+/**
+ * Decide whether a `workspace.json` bundle entry matches the install /
+ * uninstall target. Each variant matches by its own discriminant — a
+ * `{ name }` target matches `{ name }` entries on string equality;
+ * a `{ path }` target matches `{ path }` entries on string equality.
+ *
+ * Used by both the install-side duplicate guard (`bundles.some`) and the
+ * uninstall-side removal filter (`bundles.filter(b => !match(b, t))`). The
+ * previous uninstall filter only inspected `"name" in b` and so left
+ * `{ path }` entries stranded in `workspace.json` after their tool source
+ * had been deregistered.
+ *
+ * Exported so unit tests pin the contract without re-implementing it.
+ */
+export function bundleEntryMatchesTarget(
+  entry: import("../bundles/types.ts").BundleRef,
+  target: BundleTarget,
+): boolean {
+  if (target.name && "name" in entry) return entry.name === target.name;
+  if (target.path && "path" in entry) return entry.path === target.path;
+  return false;
+}
+
+/**
  * Factory that creates the `nb` system source as an in-process MCP server.
  * Merges core platform tools (list_apps, get_config, etc.) with system tools
  * (search, manage_app, delegate, etc.) into a single "nb" source.

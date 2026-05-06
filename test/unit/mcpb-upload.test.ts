@@ -19,6 +19,8 @@
 
 import { describe, expect, it } from "bun:test";
 import { join } from "node:path";
+import type { BundleRef } from "../../src/bundles/types.ts";
+import { bundleEntryMatchesTarget } from "../../src/tools/system-tools.ts";
 
 // ---------------------------------------------------------------------------
 // Fix 1: Path traversal — uploaded filename must strip directory components
@@ -74,34 +76,28 @@ describe("Fix 1: path traversal in handleBundleUpload", () => {
 // The previous filter took a single `target: string` and only matched
 // `{name}` entries — path-installed bundles became permanent residents of
 // workspace.json even after their tool source was deregistered. The new
-// filter takes `{name?, path?}` and dispatches per-variant.
-//
-// This is a unit test of the filter contract. Production wiring lives in
-// uninstallBundleFromWorkspaceViaCtx (system-tools.ts) and is exercised by
-// manual testing today; integration coverage tracks with the deferred Fix
-// 4/5/6 tests above.
+// dispatch lives in `bundleEntryMatchesTarget` (system-tools.ts) and is
+// shared between the install-side duplicate guard and the uninstall-side
+// removal filter. We import it directly so the test pins the production
+// contract rather than re-implementing it.
 // ---------------------------------------------------------------------------
 
 describe("Fix 3b: uninstall workspace.json filter handles {path} entries", () => {
-	function fixedFilter(
-		bundles: Array<{ name?: string; path?: string }>,
+	function removeMatching(
+		bundles: BundleRef[],
 		target: { name?: string; path?: string },
-	): Array<{ name?: string; path?: string }> {
-		return bundles.filter((b) => {
-			if (target.name && "name" in b) return b.name !== target.name;
-			if (target.path && "path" in b) return b.path !== target.path;
-			return true;
-		});
+	): BundleRef[] {
+		return bundles.filter((b) => !bundleEntryMatchesTarget(b, target));
 	}
 
 	it("removing a path-based bundle removes the {path} entry", () => {
-		const bundles = [
+		const bundles: BundleRef[] = [
 			{ name: "@acme/hello" },
 			{ path: "/uploads/custom.mcpb" },
 			{ name: "@acme/world" },
 		];
 
-		const result = fixedFilter(bundles, { path: "/uploads/custom.mcpb" });
+		const result = removeMatching(bundles, { path: "/uploads/custom.mcpb" });
 
 		expect(result).toHaveLength(2);
 		expect(
@@ -110,13 +106,13 @@ describe("Fix 3b: uninstall workspace.json filter handles {path} entries", () =>
 	});
 
 	it("removing a named bundle still works", () => {
-		const bundles = [
+		const bundles: BundleRef[] = [
 			{ name: "@acme/hello" },
 			{ path: "/uploads/custom.mcpb" },
 			{ name: "@acme/world" },
 		];
 
-		const result = fixedFilter(bundles, { name: "@acme/hello" });
+		const result = removeMatching(bundles, { name: "@acme/hello" });
 
 		expect(result).toHaveLength(2);
 		expect(
@@ -125,12 +121,12 @@ describe("Fix 3b: uninstall workspace.json filter handles {path} entries", () =>
 	});
 
 	it("name-targeted filter does not accidentally match path entries", () => {
-		const bundles = [
+		const bundles: BundleRef[] = [
 			{ path: "/uploads/echo.mcpb" },
 			{ name: "/uploads/echo.mcpb" },
 		];
 
-		const result = fixedFilter(bundles, { name: "/uploads/echo.mcpb" });
+		const result = removeMatching(bundles, { name: "/uploads/echo.mcpb" });
 
 		expect(result).toHaveLength(1);
 		expect(result[0]).toEqual({ path: "/uploads/echo.mcpb" });
