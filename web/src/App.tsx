@@ -27,7 +27,6 @@ import { WorkspaceRouteGuard } from "./components/WorkspaceRouteGuard";
 import { ChatProvider, useChatConfigContext, useChatContext } from "./context/ChatContext";
 import { ChatPanelProvider, useChatPanelContext } from "./context/ChatPanelContext";
 import { SessionProvider } from "./context/SessionContext";
-import { PendingAuthBanner, PendingAuthBannerSpacer } from "./components/PendingAuthBanner";
 import { ShellProvider } from "./context/ShellContext";
 import { SidebarProvider } from "./context/SidebarContext";
 import { ThemeProvider, useTheme } from "./context/ThemeContext.tsx";
@@ -44,12 +43,16 @@ import { toSlug } from "./lib/workspace-slug";
 import { ProfilePage } from "./pages/ProfilePage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { AboutTab } from "./pages/settings/AboutTab";
+import { ConnectorBrowsePage } from "./pages/settings/ConnectorBrowsePage";
+import { ConnectorDetailPage } from "./pages/settings/ConnectorDetailPage";
 import { ModelTab } from "./pages/settings/ModelTab";
+import { OrgRegistriesTab } from "./pages/settings/OrgRegistriesTab";
 import { SettingsAppPanel } from "./pages/settings/SettingsAppPanel";
 import { SkillsTab } from "./pages/settings/SkillsTab";
 import { UsageTab } from "./pages/settings/UsageTab";
 import { UsersTab } from "./pages/settings/UsersTab";
 import { WorkspaceAppsTab } from "./pages/settings/WorkspaceAppsTab";
+import { WorkspaceConnectorsTab } from "./pages/settings/WorkspaceConnectorsTab";
 import { WorkspaceDetailPage } from "./pages/settings/WorkspaceDetailPage";
 import { WorkspaceGeneralTab } from "./pages/settings/WorkspaceGeneralTab";
 import { WorkspaceMembersTab } from "./pages/settings/WorkspaceMembersTab";
@@ -215,69 +218,10 @@ function AuthenticatedAppContent({
   const { applyPreference } = useTheme();
   const wsCtx = useWorkspaceContext();
   const onDataChanged = useDataSync();
-  // Track URL bundles whose Connection is in pending_auth so the workspace
-  // shell can render an "X needs you to sign in — Connect" banner.
-  // Keyed `${serverName}|${principalId}`; updated by connection.state_changed
-  // SSE events. A row is removed once its connection transitions away from
-  // pending_auth (running, dead, etc.) — the banner clears itself.
-  const [pendingAuth, setPendingAuth] = useState<
-    Map<string, import("./types").ConnectionStateChangedEvent>
-  >(() => new Map());
   useEvents(token, wsCtx.activeWorkspace?.id, {
     onDataChanged,
     onConfigChanged: () => config.refreshConfig(),
-    onConnectionStateChanged: (evt) => {
-      setPendingAuth((prev) => {
-        const next = new Map(prev);
-        const key = `${evt.serverName}|${evt.principalId}`;
-        if (evt.state === "pending_auth") next.set(key, evt);
-        else next.delete(key);
-        return next;
-      });
-    },
   });
-
-  // Drop pending-auth rows when the active workspace changes — they're
-  // workspace-scoped and would otherwise leak across switches. Then
-  // fetch the current snapshot so the banner appears even when bundles
-  // entered pending_auth before the SSE stream connected (typical at
-  // boot for URL bundles in workspace.json).
-  useEffect(() => {
-    setPendingAuth(new Map());
-    const wsId = wsCtx.activeWorkspace?.id;
-    if (!wsId) return;
-    let cancelled = false;
-    import("./api/client").then(({ listPendingConnections }) => {
-      listPendingConnections()
-        .then(({ connections }) => {
-          if (cancelled) return;
-          if (connections.length === 0) return;
-          setPendingAuth((prev) => {
-            const next = new Map(prev);
-            for (const c of connections) {
-              const key = `${c.serverName}|${c.principalId}`;
-              if (!next.has(key)) {
-                next.set(key, {
-                  wsId,
-                  serverName: c.serverName,
-                  bundleName: c.bundleName,
-                  principalId: c.principalId,
-                  state: "pending_auth",
-                });
-              }
-            }
-            return next;
-          });
-        })
-        .catch(() => {
-          // Fail silent — if the fetch errors, SSE events still keep
-          // the banner accurate from this point on.
-        });
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [wsCtx.activeWorkspace?.id]);
 
   // Sync server-side theme preference to the client theme context
   const serverTheme = config.preferences?.theme;
@@ -344,12 +288,7 @@ function AuthenticatedAppContent({
       {/* ActionBridge handles iframe action events. It consumes ChatContext
           (streaming) but renders nothing, so its re-renders are free. */}
       <ActionBridge handleNavigate={handleNavigate} resolveAppRoute={resolveAppRoute} />
-      {/* Banner is fixed-position at the top of the viewport so it sits
-          above ChatPanel (z-10) and the sidebar; the spacer inside
-          ShellLayout pushes the main content down by the banner height. */}
-      <PendingAuthBanner pending={pendingAuth} />
       <ShellLayout forSlot={forSlot} onLogout={onLogout}>
-        <PendingAuthBannerSpacer pending={pendingAuth} />
         <ErrorBoundary resetKeys={[location.pathname]}>
           <Routes>
             {/* Root → redirect to workspace-scoped home */}
@@ -383,9 +322,36 @@ function AuthenticatedAppContent({
                 Renders inside the main shell with no inner settings nav. */}
             <Route path="/profile" element={<ProfilePage />} />
 
-            {/* Settings routes — workspace + org scopes only (Profile lives at /profile) */}
+            {/* /connections used to live at top-level; redirect any
+                old links to the workspace connectors tab. (Personal
+                connectors UI is parked until there's a real reason for
+                a separate user-scope surface.) */}
+            <Route
+              path="/connections"
+              element={<Navigate to="/settings/workspace/connectors" replace />}
+            />
+
+            {/* Settings routes — personal + workspace + org scopes (Profile lives at /profile) */}
             <Route path="/settings" element={<SettingsPage />}>
               <Route index element={<Navigate to="/settings/workspace/general" replace />} />
+
+              {/* Personal connectors UI is parked. Backend user-scope
+                  pathways stay (UserConnectorStore, lifecycle, OAuth
+                  flow) so the abstraction is unbroken — only the UI
+                  surface goes away. Redirect any in-flight links to
+                  the workspace tab. */}
+              <Route
+                path="personal/connectors"
+                element={<Navigate to="/settings/workspace/connectors" replace />}
+              />
+              <Route
+                path="personal/connectors/browse"
+                element={<Navigate to="/settings/workspace/connectors/browse" replace />}
+              />
+              <Route
+                path="personal/connectors/:serverName"
+                element={<Navigate to="/settings/workspace/connectors" replace />}
+              />
 
               {/* This Workspace — the active workspace, scoped via header switcher */}
               <Route path="workspace">
@@ -395,6 +361,15 @@ function AuthenticatedAppContent({
                 <Route path="usage" element={<UsageTab />} />
                 <Route path="apps" element={<WorkspaceAppsTab />} />
                 <Route path="apps/:serverName" element={<SettingsAppPanel />} />
+                <Route path="connectors" element={<WorkspaceConnectorsTab />} />
+                <Route
+                  path="connectors/browse"
+                  element={<ConnectorBrowsePage scope="workspace" />}
+                />
+                <Route
+                  path="connectors/:serverName"
+                  element={<ConnectorDetailPage scope="workspace" />}
+                />
                 <Route path="skills" element={<SkillsTab />} />
               </Route>
 
@@ -430,6 +405,14 @@ function AuthenticatedAppContent({
                   element={
                     <RouteGuard role="org_admin">
                       <UsersTab />
+                    </RouteGuard>
+                  }
+                />
+                <Route
+                  path="registries"
+                  element={
+                    <RouteGuard role="org_admin">
+                      <OrgRegistriesTab />
                     </RouteGuard>
                   }
                 />

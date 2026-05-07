@@ -13,14 +13,12 @@ describe("oauth-flow-registry", () => {
 
   it("resolves a registered flow with the provided code", async () => {
     const p = register("state-abc", "ws_test", "srv");
-    const matched = resolveWithCode("state-abc", "the-code");
-    expect(matched).toBe(true);
+    expect(resolveWithCode("state-abc", "the-code")).toBe(true);
     await expect(p).resolves.toBe("the-code");
   });
 
   it("returns false for unknown state on resolve", () => {
-    const matched = resolveWithCode("unknown-state", "code");
-    expect(matched).toBe(false);
+    expect(resolveWithCode("unknown-state", "code")).toBe(false);
   });
 
   it("rejects a registered flow with the provided error", async () => {

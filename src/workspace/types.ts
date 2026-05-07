@@ -33,4 +33,46 @@ export interface Workspace {
    * Set false to block all proxy routes in security-sensitive workspaces.
    */
   allowHttpProxy?: boolean;
+  /**
+   * Per-workspace catalog allow-list. When set, only catalog entries
+   * whose `id` is in this array appear on the Connections page for
+   * this workspace. When unset (default), the full loaded catalog is
+   * visible. Useful for tenanted SaaS deployments that want to expose
+   * different vendors to different customers without maintaining
+   * separate catalog ConfigMaps.
+   *
+   * Filters the catalog only — does NOT affect bundles already
+   * installed in `bundles[]` (those continue to function regardless of
+   * allow-list state). Removing an id from the allow-list while a
+   * bundle of the same name is installed is permitted; the bundle
+   * stays running but won't appear in the catalog UI.
+   */
+  connectorsAllowList?: string[];
+
+  /**
+   * Per-workspace OAuth app configurations for static-auth catalog
+   * entries. Keyed by catalog id (e.g. "asana"), the value carries the
+   * operator-supplied public `client_id` plus an audit trail. The
+   * matching `client_secret` lives in the workspace credential store
+   * under the catalog entry's `operatorSetup.clientSecretKey` — kept
+   * separate so the secret never sits next to non-secret config and
+   * the type system isn't carrying a `Redacted` for what's a public id.
+   *
+   * Lifecycle is independent of bundle install: setting up an OAuth
+   * app makes the connector installable for the whole workspace;
+   * uninstalling the connector does NOT remove this config (so a
+   * later re-install reuses it). Explicit removal goes through
+   * `manage_connectors.remove_operator_setup`.
+   */
+  oauthOperatorApps?: Record<string, OAuthOperatorAppConfig>;
+}
+
+/** Per-workspace operator-supplied OAuth app credentials, public side. */
+export interface OAuthOperatorAppConfig {
+  /** OAuth client_id from the vendor's developer portal. */
+  clientId: string;
+  /** ISO timestamp of when the operator first configured this app. */
+  configuredAt: string;
+  /** User id of the operator who set this up — audit trail only. */
+  configuredBy: string;
 }

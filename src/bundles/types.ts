@@ -105,7 +105,88 @@ export type BundleRef =
       protected?: boolean;
       trustScore?: number | null;
       ui?: BundleUiMeta | null;
+      /**
+       * OAuth identity scope for this URL bundle.
+       *
+       * - `"workspace"` (default): one identity per `(workspace, server)`. All
+       *   members share the same OAuth tokens. Correct for shared
+       *   integrations like a team Notion or org Slack.
+       * - `"user"`: each user authenticates independently and has their
+       *   own tokens at `<workDir>/users/<userId>/credentials/mcp-oauth/
+       *   <server>/`. Correct for personal-account services (Granola,
+       *   personal Gmail, personal Zoom). Opt-in per user: those who
+       *   don't connect get a structured `pending_auth` error when they
+       *   (or the agent on their behalf) try to call a tool.
+       */
+      oauthScope?: "workspace" | "user";
+      /**
+       * Pre-registered OAuth client config. Required for vendors that don't
+       * support Dynamic Client Registration (RFC 7591) — Gmail, Outlook,
+       * HubSpot, Asana, Zoom Marketplace user-OAuth apps. Operator pre-
+       * registers an app in the vendor's developer portal, gets back a
+       * `client_id` (and usually a `client_secret`), and points this field
+       * at it.
+       *
+       * When present, the OAuth provider skips DCR — `clientInformation()`
+       * returns the static client; `saveClientInformation()` is a no-op.
+       * `clientSecret` is NEVER inline — it's a reference into the
+       * credential store, resolved per-request so the secret doesn't sit
+       * in workspace.json. Operators set the secret via
+       * `nb credential set <wsId> <key> <value>`.
+       *
+       * Omit for vendors that DO support DCR (Granola, Notion). DCR is the
+       * default path; static config is the opt-in.
+       */
+      oauthClient?: OAuthClientConfig;
+      /**
+       * OAuth scopes the bundle requests. Threaded into the provider's
+       * `clientMetadata.scope` so the authorize URL carries the right
+       * `scope=` param. Surfaces the requested permissions on the review
+       * surface (admin reading workspace.json sees what the bundle asks
+       * for) and lets the same MCP server be installed at different
+       * permission levels (e.g., Gmail read-only vs. read+send).
+       *
+       * Omit to use server defaults — correct for DCR servers that derive
+       * scopes automatically (Granola, Notion).
+       */
+      scopes?: string[];
+      /**
+       * Extra query params appended to the authorize URL. Covers Google's
+       * `access_type=offline` + `prompt=consent` (needed for refresh-token
+       * issuance) and any vendor-specific parameter. Static strings only —
+       * no template interpolation.
+       *
+       * **Reserved keys rejected at config load** (`client_id`,
+       * `redirect_uri`, `response_type`, `state`, `code_challenge`,
+       * `code_challenge_method`, `scope`) so config can't override
+       * security-critical params the provider sets itself.
+       */
+      additionalAuthorizationParams?: Record<string, string>;
     };
+
+/**
+ * Config for a pre-registered OAuth client (Track A — alternative to DCR).
+ * Lives on the URL bundle ref. The provider reads `clientId` directly
+ * and resolves `clientSecret` per-request via `CredentialStore` (the
+ * value is never inline in `workspace.json`).
+ */
+export interface OAuthClientConfig {
+  /** OAuth `client_id` from the vendor's developer portal. */
+  clientId: string;
+  /**
+   * Reference to the client secret in the workspace credential store.
+   * Operator seeds the value via `nb credential set <wsId> <key> <value>`.
+   * Omit for public PKCE-only clients (rare for pre-registered).
+   */
+  clientSecret?: { ref: "credential"; key: string };
+  /**
+   * Token endpoint auth method. Defaults to "none" (PKCE-only public
+   * client) when `clientSecret` is absent; "client_secret_post" is the
+   * common case when a secret is present. "client_secret_basic" is
+   * supported for vendors that mandate it.
+   */
+  tokenEndpointAuthMethod?: "none" | "client_secret_post" | "client_secret_basic";
+}
 
 /** Bundle lifecycle states. */
 export type BundleState =
@@ -115,12 +196,30 @@ export type BundleState =
   | "dead"
   | "stopped"
   /**
-   * Remote URL bundle is waiting for the user to complete an interactive
-   * OAuth flow. The bundle's MCP source is constructed but not connected;
-   * tools are unavailable until the user completes auth via
-   * `POST /v1/mcp-auth/initiate` → AS → `GET /v1/mcp-auth/callback`.
+   * URL bundle is installed but no tokens exist for this principal. Initial
+   * state for a freshly-installed URL bundle, and the resting state after
+   * `disconnect`. UI shows "Connect" — clicking initiates the OAuth flow
+   * (transitioning to `pending_auth`).
    */
-  | "pending_auth";
+  | "not_authenticated"
+  /**
+   * URL bundle is actively in an OAuth flow. The user (or agent) clicked
+   * Connect; we've captured an authorization URL and are awaiting the
+   * browser callback. Tools are unavailable until the callback completes
+   * (transitions to `running`) or fails (transitions to `dead`).
+   */
+  | "pending_auth"
+  /**
+   * URL bundle was previously `running` but its refresh token failed (rotated,
+   * revoked, or AS rejected). Tools that need this connection will fail until
+   * the user reconnects. UI shows "Reconnect" — clicking initiates a fresh
+   * OAuth flow (transitioning to `pending_auth`).
+   *
+   * Distinct from `not_authenticated` so the UI can surface a stronger
+   * affordance ("your previously-working connection broke") and from
+   * `dead` so the UI knows reconnection is the recovery path.
+   */
+  | "reauth_required";
 
 /** MCP server config — how to spawn the process. */
 export interface McpConfig {
@@ -231,12 +330,13 @@ export interface BundleInstance {
   /** Absolute path to the entity data root (e.g., {wsDir}/data/{bundle}/apps/crm/data). Resolved at startup. */
   entityDataRoot?: string;
   /**
-   * OAuth identity scope for URL bundles. Defaults to "workspace".
-   * `"member"` is plumbed through types in Step 1 but only lights up in
-   * Step 3 — Step 1 always treats this as `"workspace"` regardless of
-   * declared value. Undefined for non-URL bundles.
+   * OAuth identity scope for URL bundles. Defaults to "workspace" —
+   * one shared identity per (workspace, server). `"user"` flips to
+   * per-user storage at `<workDir>/users/<userId>/credentials/...`,
+   * letting each user authenticate independently against the same
+   * remote service. Undefined for non-URL bundles.
    */
-  oauthScope?: "workspace" | "member";
+  oauthScope?: "workspace" | "user";
   /**
    * Per-principal Connections for URL bundles. Each entry is one
    * (bundle, principal) tuple owning an McpSource and its OAuth state
@@ -252,6 +352,15 @@ export interface BundleInstance {
    * speak OAuth.
    */
   connections?: Map<string, import("./connection.ts").Connection>;
+  /**
+   * Original `BundleRef` for URL bundles, retained on the instance so
+   * lifecycle can reconstruct per-member `McpSource`s on-demand for
+   * `oauthScope: "user"` (the URL, transport config, oauthClient and
+   * scopes are all on the ref). Undefined for non-URL bundles —
+   * named/local bundles don't need to spawn additional sources after
+   * boot.
+   */
+  ref?: BundleRef;
 }
 
 /** Metadata extracted from a local bundle's manifest during startup. */

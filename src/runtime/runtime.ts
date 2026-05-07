@@ -43,8 +43,10 @@ import { DEV_IDENTITY } from "../identity/providers/dev.ts";
 import { UserStore } from "../identity/user.ts";
 import { InstructionsStore } from "../instructions/index.ts";
 import { buildModelResolver, resolveModelString } from "../model/registry.ts";
+import { PermissionStore } from "../permissions/permission-store.ts";
 import type { Layer3SkillEntry, PromptAppInfo } from "../prompt/compose.ts";
 import { composeSystemPrompt } from "../prompt/compose.ts";
+import { RegistryStore } from "../registries/registry-store.ts";
 import {
   loadBuiltinSkills,
   loadCoreSkills,
@@ -64,6 +66,7 @@ import { McpSource } from "../tools/mcp-source.ts";
 import type { ToolRegistry } from "../tools/registry.ts";
 import { createSystemTools } from "../tools/system-tools.ts";
 import type { ResourceData } from "../tools/types.ts";
+import { UserConnectorStore } from "../users/user-connector-store.ts";
 import { WorkspaceStore } from "../workspace/workspace-store.ts";
 import { RunInProgressError } from "./errors.ts";
 import { PlacementRegistry } from "./placement-registry.ts";
@@ -171,6 +174,9 @@ export class Runtime {
   private _instanceConfig: InstanceConfig | null;
   private _userStore: UserStore;
   private _workspaceStore: WorkspaceStore;
+  private _userConnectorStore: UserConnectorStore | null = null;
+  private _permissionStore: PermissionStore | null = null;
+  private _registryStore: RegistryStore | null = null;
   private _identityProvider: IdentityProvider | null;
   /** Getter for the current request identity — reads from AsyncLocalStorage. */
   _getIdentity: () => UserIdentity | null = () => null;
@@ -539,15 +545,59 @@ export class Runtime {
     rt._workspaceRegistries = workspaceRegistries;
     rt._platformSources = platformSources;
 
+    // Wire the workspace registries into lifecycle so workspace-scope
+    // startAuth / disconnect / install can add+remove sources without
+    // each route having to thread the registry through.
+    lifecycle.setWorkspaceRegistries(workspaceRegistries);
+
+    // User-scope install needs to know which workspaces a user is in
+    // to register their personal bundles into each workspace's tool
+    // registry. Closure-based to avoid an import cycle (lifecycle ←→
+    // workspaceStore would be circular).
+    lifecycle.setWorkspacesForUserResolver(async (userId: string) => {
+      const all = await workspaceStore.getWorkspacesForUser(userId);
+      return all.map((ws) => ws.id);
+    });
+
     // Seed lifecycle instances for workspace bundles (user-installed only)
     for (const entry of workspaceBundleEntries) {
       const { serverName: sn, bundle: ref, meta, wsId, dataDir } = entry;
       const label = "name" in ref ? ref.name : "url" in ref ? ref.url : ref.path;
-      lifecycle.seedInstance(sn, label, ref, meta ?? undefined, wsId, dataDir);
+      // Pass the per-workspace registry so seedInstance can register a
+      // UserPoolSource for user-scope URL bundles (used in workspace.json
+      // for the legacy "member" path; new user-scope installs flow
+      // through user.json + seedUserInstance below).
+      const wsRegistry = workspaceRegistries.get(wsId);
+      lifecycle.seedInstance(sn, label, ref, meta ?? undefined, wsId, dataDir, wsRegistry);
 
       const instance = lifecycle.getInstance(sn, wsId);
       if (instance?.ui?.placements && instance.ui.placements.length > 0) {
         placementRegistry.register(sn, instance.ui.placements, wsId);
+      }
+    }
+
+    // Boot pass for user-scope personal connections. Each user.json
+    // declares the bundles that user has personally installed; for each
+    // (user, bundle) pair we seed a user-scope BundleInstance and wire
+    // a UserPoolSource into every workspace registry the user is in.
+    // Errors here are isolated per-record so a single corrupt user.json
+    // doesn't prevent boot.
+    const userConnStore = rt.getUserConnectorStore();
+    const allUsers = await userConnStore.list();
+    for (const userRecord of allUsers) {
+      for (const ref of userRecord.bundles) {
+        if (!("url" in ref)) continue;
+        const sn =
+          ref.serverName ?? new URL(ref.url).hostname.replace(/[^a-z0-9]/gi, "-").toLowerCase();
+        try {
+          await lifecycle.seedUserInstance(sn, ref, userRecord.userId);
+        } catch (err) {
+          process.stderr.write(
+            `[runtime] Failed to seed user-scope "${sn}" for ${userRecord.userId}: ${
+              err instanceof Error ? err.message : String(err)
+            }\n`,
+          );
+        }
       }
     }
 
@@ -840,6 +890,11 @@ export class Runtime {
         skillsLoaded,
         contextAssembled,
       },
+      // Agent-loop identity rule: tool calls inside this run authenticate
+      // as the request's identity (= conversation owner for chat-based
+      // runs). Member-scoped MCP bundles use this to route to the right
+      // per-principal source. Workspace-scoped sources ignore it.
+      ...(request.identity ? { principalId: request.identity.id } : {}),
     };
 
     // Determine which event store handles conversation events for this request.
@@ -1277,6 +1332,9 @@ export class Runtime {
     }
 
     const wsRegistry = createWorkspaceRegistry(this._platformSources, this._systemSource);
+    // Wire permission context so the registry can gate disallowed tools
+    // before they reach the source.execute() path.
+    wsRegistry.setPermissionContext(wsId, this.getPermissionStore());
     this._workspaceRegistries.set(wsId, wsRegistry);
     return wsRegistry;
   }
@@ -1304,6 +1362,43 @@ export class Runtime {
   /** Get the WorkspaceStore instance. */
   getWorkspaceStore(): WorkspaceStore {
     return this._workspaceStore;
+  }
+
+  /**
+   * Get the UserConnectorStore — per-user storage for personal connections.
+   * Lazily constructed on first access and cached. Mirrors the WorkspaceStore
+   * pattern but operates on `users/<userId>/user.json` instead of
+   * `workspaces/<wsId>/workspace.json`.
+   */
+  getUserConnectorStore(): UserConnectorStore {
+    if (!this._userConnectorStore) {
+      this._userConnectorStore = new UserConnectorStore(this.getWorkDir());
+    }
+    return this._userConnectorStore;
+  }
+
+  /**
+   * Get the PermissionStore — per-tool policy lookups for installed
+   * connectors. File-backed, scoped per (user × connector) and
+   * (workspace × connector). Lazy + cached.
+   */
+  getPermissionStore(): PermissionStore {
+    if (!this._permissionStore) {
+      this._permissionStore = new PermissionStore(this.getWorkDir());
+    }
+    return this._permissionStore;
+  }
+
+  /**
+   * Get the RegistryStore — instance-level config of which connector
+   * registries (curated / mpak / future) are enabled. Auto-seeds with
+   * sensible defaults on first read.
+   */
+  getRegistryStore(): RegistryStore {
+    if (!this._registryStore) {
+      this._registryStore = new RegistryStore(this.getWorkDir());
+    }
+    return this._registryStore;
   }
 
   /** Get the IdentityProvider (null in dev mode when no instance.json). */
@@ -1743,6 +1838,17 @@ export class Runtime {
   /** Get the resolved work directory path. */
   getWorkDir(): string {
     return resolveWorkDir(this.config);
+  }
+
+  /**
+   * Whether the runtime allows OAuth flows / bundle URLs to target loopback
+   * / RFC1918 / cloud-metadata hosts. Mirrors `config.allowInsecureRemotes`;
+   * read by `/v1/mcp-auth/initiate` when constructing per-member providers
+   * for `oauthScope: "user"` URL bundles so the SSRF allowlist matches
+   * the boot-time provider's behavior.
+   */
+  getAllowInsecureRemotes(): boolean {
+    return this.config.allowInsecureRemotes === true;
   }
 
   /** Inject the per-conversation event manager for participant eviction on removal/unshare. */

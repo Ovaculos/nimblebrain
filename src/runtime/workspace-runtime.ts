@@ -8,6 +8,7 @@
 
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { hasPersistedWorkspaceOAuthTokens } from "../bundles/oauth-tokens.ts";
 import { deriveServerName, resolveBundleDataDir } from "../bundles/paths.ts";
 import { setPendingAuth } from "../bundles/pending-auth-buffer.ts";
 import { startBundleSource } from "../bundles/startup.ts";
@@ -200,6 +201,61 @@ export async function startWorkspaceBundles(
   await mapWithConcurrency(flat, concurrency, async ({ wsId, entry }, idx) => {
     const wsRegistry = registries.get(wsId);
     if (!wsRegistry) return; // unreachable: registries is keyed by every wsId in byWorkspace
+
+    // User-scoped URL bundles don't auto-start at boot — there's no
+    // user identity to authenticate as. Connections are created lazily
+    // on first call from each user. We still record the bundle so it
+    // appears in the workspace's installed list (Settings → Connectors
+    // surface, via `manage_connectors.list_installed`) and the
+    // lifecycle's seedInstance can wire it up with an empty
+    // connections map.
+    if ("url" in entry.bundle && entry.bundle.oauthScope === "user") {
+      log.info(
+        `[bundles] Skipping boot start for user-scoped URL bundle "${entry.serverName}" — connections created on-demand`,
+      );
+      resultEntries[idx] = {
+        ...entry,
+        meta: {
+          version: "remote (member-scope)",
+          ui: entry.bundle.ui ?? null,
+          briefing: null,
+          httpProxy: null,
+          type: "plain" as const,
+        },
+      };
+      return;
+    }
+
+    // Workspace-scoped URL bundles without persisted tokens also skip
+    // auto-start at boot — there's nothing to connect with. The
+    // Connection sits in `not_authenticated` until the user clicks
+    // Connect (which triggers `lifecycle.startAuth`). This is what
+    // keeps a fresh install silent — no surprise OAuth banner on a
+    // bundle the user added but hasn't authenticated yet.
+    // `seedInstance` consults the same token check to set state.
+    if ("url" in entry.bundle) {
+      const scope = entry.bundle.oauthScope ?? "workspace";
+      if (
+        scope === "workspace" &&
+        !hasPersistedWorkspaceOAuthTokens(workDir, entry.wsId, entry.serverName)
+      ) {
+        log.info(
+          `[bundles] Skipping boot start for workspace-scope URL bundle "${entry.serverName}" — no tokens yet (state: not_authenticated)`,
+        );
+        resultEntries[idx] = {
+          ...entry,
+          meta: {
+            version: "remote",
+            ui: entry.bundle.ui ?? null,
+            briefing: null,
+            httpProxy: null,
+            type: "plain" as const,
+          },
+        };
+        return;
+      }
+    }
+
     try {
       const result = await startBundleSource(entry.bundle, wsRegistry, eventSink, configDir, {
         allowInsecureRemotes: opts?.allowInsecureRemotes,

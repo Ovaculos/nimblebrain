@@ -16,6 +16,7 @@ import type { EventSink, ToolResult } from "../engine/types.ts";
 import type { Runtime } from "../runtime/runtime.ts";
 import type { Skill } from "../skills/types.ts";
 import type { WorkspaceStore } from "../workspace/workspace-store.ts";
+import { createManageConnectorsTool } from "./connector-tools.ts";
 import type { ManageConversationContext } from "./conversation-tools.ts";
 import { buildCoreResourceMap } from "./core-resources/index.ts";
 import { createCoreToolDefs } from "./core-source.ts";
@@ -24,6 +25,7 @@ import { createDelegateTool } from "./delegate.ts";
 import { defineInProcessApp, type InProcessTool } from "./in-process-app.ts";
 import { McpSource } from "./mcp-source.ts";
 import type { ToolRegistry } from "./registry.ts";
+import { createManageRegistriesTool } from "./registry-tools.ts";
 import { createManageUsersTool, type ManageUsersContext } from "./user-tools.ts";
 import {
   createManageWorkspacesTool,
@@ -252,6 +254,29 @@ export async function createSystemTools(
         : {}),
     };
     systemToolDefs.push(createManageWorkspacesTool(mergedCtx));
+  }
+
+  // Connectors tool. Surface includes both workspace-scope and
+  // user-scope (personal) connectors under one tool action surface —
+  // the right scope is chosen by the catalog entry's `defaultScope` for
+  // installs and by lookup for disconnects.
+  if (runtime && manageWorkspacesCtx) {
+    systemToolDefs.push(
+      createManageConnectorsTool({
+        runtime,
+        getIdentity: manageWorkspacesCtx.getIdentity,
+        // Workspace id is per-call — pull from the runtime's current
+        // workspace context (same source manage_app uses to know which
+        // workspace's bundles[] to mutate).
+        getWorkspaceId: () => runtime.getCurrentWorkspaceId(),
+      }),
+    );
+    systemToolDefs.push(
+      createManageRegistriesTool({
+        runtime,
+        getIdentity: manageWorkspacesCtx.getIdentity,
+      }),
+    );
   }
 
   // Filter out system tools whose feature flag is disabled.

@@ -525,18 +525,292 @@ export async function initiateMcpOAuth(
 }
 
 /**
- * Snapshot of Connections in pending_auth for the active workspace.
- * The web banner fetches this on workspace render so it appears even if
- * the bundle entered pending_auth before the SSE stream connected
- * (typical for boot-time URL bundles). Subsequent state changes flow
- * through SSE.
+ * Connectors catalog entry — one card on Settings → Connectors.
+ * Mirrors the server-side `ConnectorCatalogEntry` shape.
  */
-export async function listPendingConnections(): Promise<{
-  connections: Array<{ serverName: string; bundleName: string; principalId: string }>;
+export interface ConnectorCatalogEntry {
+  id: string;
+  name: string;
+  description: string;
+  iconUrl: string;
+  url: string;
+  auth: "dcr" | "static";
+  defaultScope: "workspace" | "user";
+  requiredScopes?: string[];
+  additionalAuthorizationParams?: Record<string, string>;
+  operatorSetup?: { portalUrl: string; hint: string; clientSecretKey: string };
+  tags?: string[];
+  /** When true, the connector exposes a UI surface — render the "Interactive" badge. */
+  interactive?: boolean;
+  /** Optional connector-specific docs URL surfaced on the Configure page. */
+  docsUrl?: string;
+}
+
+/**
+ * Per-(scope, principal) installed view. Returns every bundle visible
+ * in the workspace (or user) — local stdio servers, local URL bundles,
+ * Synapse apps, and remote OAuth connectors. `type` distinguishes
+ * remote URL connectors from local in-process / subprocess bundles.
+ */
+export interface InstalledConnector {
+  serverName: string;
+  bundleName: string;
+  version: string;
+  type: "remote" | "local";
+  state: string;
+  scope: "workspace" | "user";
+  /** Whether this connector exposes a UI surface (auto-mounts a sidebar entry). */
+  interactive: boolean;
+  toolCount: number;
+  trustScore: number | null;
+  // ── Optional fields, only populated for URL bundles / catalog-matched ──
+  url?: string;
+  catalogId?: string | null;
+  catalog?: ConnectorCatalogEntry;
+  authorizationUrl?: string;
+  identity?: { sub?: string; email?: string; name?: string };
+  missingOperatorSetup?: boolean;
+}
+
+/**
+ * Connector management — all-in-one tool surface. The web shell calls
+ * `nb__manage_connectors` (alias `manage_connectors` on the `nb`
+ * source) for catalog browse, installed list, install, and disconnect.
+ * No dedicated REST routes — the platform's tool-call surface is the
+ * canonical first-party API.
+ *
+ * The OAuth flow itself stays on routes (`/v1/mcp-auth/initiate` +
+ * `/callback`) because it sets a session-bound state cookie and the
+ * callback is a browser redirect target — neither composes cleanly
+ * over `/v1/tools/call`.
+ */
+
+function unwrapStructured<T>(result: ToolCallResult, what: string): T {
+  if (result.isError) {
+    const text = result.content?.[0]?.type === "text" ? result.content[0].text : "";
+    throw new Error(text || `${what} failed.`);
+  }
+  return result.structuredContent as T;
+}
+
+export async function getConnectorsCatalog(): Promise<{ catalog: ConnectorCatalogEntry[] }> {
+  const result = await callTool("nb", "manage_connectors", { action: "list_catalog" });
+  return unwrapStructured(result, "list_catalog");
+}
+
+export async function getInstalledConnectors(opts?: {
+  scope?: "all" | "workspace" | "user";
+}): Promise<{ installed: InstalledConnector[] }> {
+  const result = await callTool("nb", "manage_connectors", {
+    action: "list_installed",
+    scope: opts?.scope ?? "all",
+  });
+  return unwrapStructured(result, "list_installed");
+}
+
+export async function disconnectConnector(
+  serverName: string,
+  scope?: "workspace" | "user",
+): Promise<{
+  ok: boolean;
+  scope: "workspace" | "user";
+  revoked: { access?: boolean; refresh?: boolean };
+  deletedLocal: boolean;
+  revokeError?: string;
 }> {
-  return request<{
-    connections: Array<{ serverName: string; bundleName: string; principalId: string }>;
-  }>("/v1/connections/pending");
+  const result = await callTool("nb", "manage_connectors", {
+    action: "disconnect",
+    serverName,
+    ...(scope ? { scope } : {}),
+  });
+  return unwrapStructured(result, "disconnect");
+}
+
+/**
+ * Full uninstall — works for any bundle type. For OAuth connectors,
+ * revokes tokens upstream first; for local bundles, just removes from
+ * workspace.json. Drops tool permissions associated with the connector.
+ */
+export async function uninstallConnector(
+  serverName: string,
+  scope: "workspace" | "user",
+): Promise<{ ok: boolean; scope: "workspace" | "user"; serverName: string }> {
+  const result = await callTool("nb", "manage_connectors", {
+    action: "uninstall",
+    serverName,
+    scope,
+  });
+  return unwrapStructured(result, "uninstall");
+}
+
+/**
+ * Install a catalog entry. Routes to user-scope or workspace-scope
+ * storage based on the catalog entry's `defaultScope`. Idempotent —
+ * if already installed, returns `alreadyInstalled: true`. Does NOT
+ * start OAuth — caller follows up with `initiateMcpOAuth(serverName)`.
+ */
+export async function installConnector(catalogId: string): Promise<{
+  ok: boolean;
+  alreadyInstalled: boolean;
+  serverName: string;
+  scope: "workspace" | "user";
+}> {
+  const result = await callTool("nb", "manage_connectors", {
+    action: "install",
+    catalogId,
+  });
+  return unwrapStructured(result, "install");
+}
+
+export interface ConnectorTool {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+}
+
+/**
+ * One row in the Browse directory — uniform shape across registry
+ * sources (curated, mpak, future). The `install` discriminator drives
+ * the install-button behavior in the UI.
+ */
+export interface DirectoryEntry {
+  id: string;
+  registryId: string;
+  registryType: "curated" | "mpak" | "directory" | "custom-url";
+  name: string;
+  description: string;
+  iconUrl?: string;
+  tags?: string[];
+  defaultScope: "user" | "workspace";
+  /**
+   * Static-auth entries: true when the workspace has both clientId and
+   * client_secret configured. Undefined for entries where operator
+   * setup doesn't apply (DCR remote-oauth, mpak, direct-url).
+   */
+  operatorConfigured?: boolean;
+  install:
+    | {
+        kind: "remote-oauth";
+        url: string;
+        auth: "dcr" | "static";
+        requiredScopes?: string[];
+        additionalAuthorizationParams?: Record<string, string>;
+        operatorSetup?: { portalUrl: string; hint: string; clientSecretKey: string };
+      }
+    | { kind: "mpak-bundle"; package: string; version?: string; mpakUrl?: string }
+    | { kind: "direct-url"; url: string };
+}
+
+export interface DirectoryResult {
+  entries: DirectoryEntry[];
+  errors: Array<{ registryId: string; message: string }>;
+}
+
+export async function listDirectory(): Promise<DirectoryResult> {
+  const result = await callTool("nb", "manage_connectors", { action: "list_directory" });
+  return unwrapStructured(result, "list_directory");
+}
+
+/**
+ * Configure the workspace's OAuth app for a static-auth catalog
+ * connector. Upsert — calling this on an already-configured connector
+ * rotates both pieces. ws_admin gated.
+ */
+export async function setupConnectorOperator(
+  catalogId: string,
+  clientId: string,
+  clientSecret: string,
+): Promise<{ ok: boolean; catalogId: string; clientId: string }> {
+  const result = await callTool("nb", "manage_connectors", {
+    action: "setup_operator",
+    catalogId,
+    clientId,
+    clientSecret,
+  });
+  return unwrapStructured(result, "setup_operator");
+}
+
+export async function removeConnectorOperatorSetup(
+  catalogId: string,
+): Promise<{ ok: boolean; catalogId: string }> {
+  const result = await callTool("nb", "manage_connectors", {
+    action: "remove_operator_setup",
+    catalogId,
+  });
+  return unwrapStructured(result, "remove_operator_setup");
+}
+
+export interface RegistryConfig {
+  id: string;
+  name: string;
+  type: "curated" | "mpak" | "directory" | "custom-url";
+  enabled: boolean;
+  url?: string;
+  locked?: boolean;
+}
+
+export async function listRegistries(): Promise<{ registries: RegistryConfig[] }> {
+  const result = await callTool("nb", "manage_registries", { action: "list" });
+  return unwrapStructured(result, "list");
+}
+
+export async function setRegistryEnabled(
+  id: string,
+  enabled: boolean,
+): Promise<{ ok: boolean; registry: RegistryConfig }> {
+  const result = await callTool("nb", "manage_registries", {
+    action: enabled ? "enable" : "disable",
+    id,
+  });
+  return unwrapStructured(result, enabled ? "enable" : "disable");
+}
+
+export async function setRegistryUrl(
+  id: string,
+  url: string,
+): Promise<{ ok: boolean; registry: RegistryConfig }> {
+  const result = await callTool("nb", "manage_registries", { action: "set_url", id, url });
+  return unwrapStructured(result, "set_url");
+}
+
+export async function listConnectorTools(
+  serverName: string,
+  scope?: "workspace" | "user",
+): Promise<{ tools: ConnectorTool[] }> {
+  const result = await callTool("nb", "manage_connectors", {
+    action: "list_tools",
+    serverName,
+    ...(scope ? { scope } : {}),
+  });
+  return unwrapStructured(result, "list_tools");
+}
+
+export type ToolPolicy = "allow" | "disallow";
+
+export async function getConnectorPermissions(
+  serverName: string,
+  scope: "workspace" | "user",
+): Promise<{ scope: "workspace" | "user"; serverName: string; tools: Record<string, ToolPolicy> }> {
+  const result = await callTool("nb", "manage_connectors", {
+    action: "get_permissions",
+    serverName,
+    scope,
+  });
+  return unwrapStructured(result, "get_permissions");
+}
+
+export async function setConnectorPermissions(
+  serverName: string,
+  scope: "workspace" | "user",
+  tools: Record<string, ToolPolicy>,
+): Promise<{ ok: boolean; scope: "workspace" | "user"; serverName: string }> {
+  const result = await callTool("nb", "manage_connectors", {
+    action: "set_permissions",
+    serverName,
+    scope,
+    tools,
+  });
+  return unwrapStructured(result, "set_permissions");
 }
 
 /** Clear the server-side session cookie. Fails silently on error. */

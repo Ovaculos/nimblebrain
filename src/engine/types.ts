@@ -12,8 +12,13 @@ export interface ToolRouter {
    * cancellation from the engine down to the tool implementation. For
    * task-augmented MCP tools it becomes `tasks/cancel`; for inline tools
    * it's an `AbortSignal` forwarded on the request.
+   *
+   * `principalId` is the identity to authenticate as for member-scoped
+   * remote MCP bundles — the conversation owner's user id for agent-loop
+   * calls, the explicit caller for the REST `/v1/tools/call` path. Single-
+   * principal sources ignore it; only `UserPoolSource` reads it.
    */
-  execute(call: ToolCall, signal?: AbortSignal): Promise<ToolResult>;
+  execute(call: ToolCall, signal?: AbortSignal, principalId?: string): Promise<ToolResult>;
 }
 
 export interface ToolSchema {
@@ -167,6 +172,15 @@ export interface EngineConfig {
    * may add more entries here without touching the engine signature.
    */
   runMetadata?: RunMetadata;
+  /**
+   * Identity to authenticate as for member-scoped MCP bundles invoked
+   * during this run. Set by the runtime to the conversation owner's
+   * user id (the agent-loop identity rule). When undefined, member-scoped
+   * tool calls return a structured `pending_auth`-style error instead of
+   * silently using someone else's tokens. Workspace-scoped sources ignore
+   * this entirely.
+   */
+  principalId?: string;
 }
 
 /**

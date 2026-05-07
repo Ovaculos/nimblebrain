@@ -1,6 +1,7 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { Hono } from "hono";
 import { WORKSPACE_PRINCIPAL_ID } from "../../bundles/connection.ts";
+import { log } from "../../cli/log.ts";
 import { resolveWithCode } from "../../tools/oauth-flow-registry.ts";
 import { requireAuth } from "../middleware/auth.ts";
 import { requireWorkspace } from "../middleware/workspace.ts";
@@ -36,12 +37,11 @@ export function mcpAuthRoutes(ctx: AppContext) {
 
   // ── POST /v1/mcp-auth/initiate ────────────────────────────────────
   //
-  // Workspace-authed. Body: { serverName }. Step 1 is workspace-scope only,
-  // so the principal is always WORKSPACE_PRINCIPAL_ID — we deliberately
-  // do NOT read it from the request body. Step 3 will accept a validated
-  // `principalId` here, with the caller authenticated as that member and
-  // user-supplied "_"-prefixed values rejected (the underscore prefix is
-  // reserved for synthetic principals — see connection.ts:8-13).
+  // Workspace-authed. Body: { serverName }. Resolves the principal from
+  // the bundle's declared scope (workspace-scope → WORKSPACE_PRINCIPAL_ID;
+  // member-scope → calling user id). Calls `lifecycle.startAuth` which
+  // is idempotent on double-click and tears down stale sources (so
+  // disconnect → reconnect works without a process restart).
   //
   // Auth + workspace middleware applied per-handler (not via .use("*"))
   // so the unauthenticated /callback below is unaffected. Hono's
@@ -63,16 +63,54 @@ export function mcpAuthRoutes(ctx: AppContext) {
       if (!serverName) {
         return apiError(400, "bad_request", "serverName is required.");
       }
-      const principalId = WORKSPACE_PRINCIPAL_ID;
 
       const wsId = c.var.workspaceId;
       const lifecycle = ctx.runtime.getLifecycle();
-      const authorizationUrl = lifecycle.getPendingAuthUrl(serverName, wsId, principalId);
-      if (!authorizationUrl) {
+
+      const instance = lifecycle.getInstance(serverName, wsId);
+      if (!instance) {
+        return apiError(404, "bundle_not_found", `Bundle "${serverName}" not installed.`);
+      }
+
+      // Resolve the principal from the bundle's scope. Member-scope
+      // requires an authenticated identity to act as.
+      const oauthScope = instance.oauthScope ?? "workspace";
+      let principalId: string;
+      if (oauthScope === "user") {
+        const callerId = c.var.identity?.id;
+        if (!callerId) {
+          return apiError(
+            401,
+            "unauthenticated",
+            "Member-scope bundles require an authenticated user.",
+          );
+        }
+        principalId = callerId;
+      } else {
+        principalId = WORKSPACE_PRINCIPAL_ID;
+      }
+
+      let authorizationUrl: string;
+      try {
+        const apiBase = process.env.NB_API_URL ?? "http://localhost:27247";
+        const callbackUrl = `${apiBase.replace(/\/+$/, "")}/v1/mcp-auth/callback`;
+        const result = await lifecycle.startAuth(serverName, wsId, principalId, {
+          workDir: ctx.runtime.getWorkDir(),
+          callbackUrl,
+          allowInsecureRemotes: ctx.runtime.getAllowInsecureRemotes(),
+        });
+        authorizationUrl = result.authorizationUrl;
+      } catch (err) {
+        // Don't leak SDK / DNS / TLS details in the response body.
+        // Workspace-authed callers, but the surface is wide and the
+        // body crosses trust boundaries (proxies, browser dev tools,
+        // HAR export). Log raw server-side; return a generic shape.
+        const msg = err instanceof Error ? err.message : String(err);
+        log.warn(`[mcp-auth] startAuth failed for ${serverName} in ${wsId}: ${msg}`);
         return apiError(
-          404,
-          "not_pending_auth",
-          `No pending OAuth flow for serverName="${serverName}" in this workspace.`,
+          500,
+          "auth_start_failed",
+          "Failed to start OAuth flow. Check server logs for details.",
         );
       }
 
@@ -110,25 +148,6 @@ export function mcpAuthRoutes(ctx: AppContext) {
       c.header("Set-Cookie", cookieParts.join("; "));
 
       return c.json({ authorizationUrl });
-    },
-  );
-
-  // ── GET /v1/connections/pending ────────────────────────────────────
-  //
-  // Workspace-authed snapshot of Connections in pending_auth. The web
-  // client fetches this once on workspace render to populate the banner
-  // — connection.state_changed SSE events only fire from connect time
-  // forward, so a client that connects after a bundle entered
-  // pending_auth would otherwise miss the signal until reload.
-  app.get(
-    "/v1/connections/pending",
-    requireAuth(ctx.authOptions),
-    requireWorkspace(ctx.workspaceStore),
-    (c) => {
-      const wsId = c.var.workspaceId;
-      const lifecycle = ctx.runtime.getLifecycle();
-      const pending = lifecycle.getPendingConnections(wsId);
-      return c.json({ connections: pending });
     },
   );
 
@@ -175,14 +194,19 @@ export function mcpAuthRoutes(ctx: AppContext) {
       );
     }
 
-    const matched = resolveWithCode(state, code);
-    if (!matched) {
+    if (!resolveWithCode(state, code)) {
       return c.html(
         "<html><body><h3>Unknown or expired OAuth flow.</h3>" +
           "<p>Re-initiate the connection from NimbleBrain.</p></body></html>",
         404,
       );
     }
+
+    // Every connector lands on the workspace Connectors page. Personal
+    // Connectors UI is parked, so user-scope bundles share the same
+    // landing for now; when Personal returns, scope-aware dispatch
+    // here can read `lifecycle.getInstance(serverName, wsId).oauthScope`
+    // to branch.
 
     // Clear the one-shot state cookie so a refresh of this page can't
     // be used as a replay vector.
@@ -196,9 +220,60 @@ export function mcpAuthRoutes(ctx: AppContext) {
     if (!ctx.isLocalhost) expireParts.push("Secure");
     c.header("Set-Cookie", expireParts.join("; "));
 
+    // Auto-redirect back to the Connectors page (Personal or Workspace
+    // depending on the bundle's scope). The user came from NimbleBrain
+    // and was navigated away to the OAuth provider in their existing
+    // tab — telling them to "close this tab" is wrong because they'd
+    // lose NimbleBrain entirely. We bring them home.
+    //
+    // Resolution order for the return URL:
+    //   1. NB_WEB_URL env (operator config — production should set this
+    //      to the platform's user-facing origin)
+    //   2. NB_API_URL env (in single-origin deployments the API and
+    //      SPA share a host)
+    //   3. The request origin (last-resort: callback hit us at ${origin},
+    //      so the SPA is *probably* on the same origin)
+    const fallbackOrigin = (() => {
+      try {
+        return new URL(c.req.url).origin;
+      } catch {
+        return "";
+      }
+    })();
+    const webBase = process.env.NB_WEB_URL ?? process.env.NB_API_URL ?? fallbackOrigin;
+    let returnUrl = `${webBase.replace(/\/+$/, "")}/settings/workspace/connectors`;
+    // Defense-in-depth: NB_WEB_URL / NB_API_URL are operator-controlled,
+    // but a malformed value with a `javascript:` / `data:` scheme would
+    // survive escapeHtml (which only escapes `&<>"'`) and execute when
+    // the meta-refresh fires. Validate the protocol; fall back to a
+    // same-origin relative path if anything looks off.
+    try {
+      const parsed = new URL(returnUrl);
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        returnUrl = "/settings/workspace/connectors";
+      }
+    } catch {
+      returnUrl = "/settings/workspace/connectors";
+    }
+    const safeReturnUrl = escapeHtml(returnUrl);
+    // Inline-script injection guard. `JSON.stringify` produces a valid
+    // JS string literal but does NOT escape `</script>` or `<!--` —
+    // those sequences would break out of script context even though
+    // they don't contain HTML metacharacters that escapeHtml /
+    // protocol-allowlist catch. Encode `<` as `<` so any literal
+    // `</script>` / `<!--` in the URL becomes a benign string. The
+    // protocol allowlist above already covers `javascript:` / `data:`
+    // schemes; this closes the parallel script-context exit.
+    const safeJsReturnUrl = JSON.stringify(returnUrl).replace(/</g, "\\u003c");
     return c.html(
-      "<html><body><h3>Authorization complete.</h3>" +
-        "<p>You can close this tab and return to NimbleBrain.</p></body></html>",
+      `<!doctype html><html><head><meta charset="utf-8"><title>Authorization complete</title>
+        <meta http-equiv="refresh" content="1;url=${safeReturnUrl}"></head>
+        <body style="font-family:system-ui,sans-serif;padding:2rem;max-width:32rem;margin:0 auto">
+          <h3 style="margin:0 0 0.5rem">Authorization complete</h3>
+          <p style="color:#555">Returning to NimbleBrain…</p>
+          <p><a href="${safeReturnUrl}">Click here if you aren't redirected →</a></p>
+          <script>setTimeout(function(){location.replace(${safeJsReturnUrl});},800);</script>
+        </body></html>`,
     );
   });
 

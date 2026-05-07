@@ -13,6 +13,12 @@ import type { PlacementEntry } from "../types";
 //   workspace     — the active workspace (its identity, members, app config)
 //   organization  — the org as a whole (manage all workspaces / users)
 //
+// A "personal" group is reserved for future per-user settings (personal
+// connectors, identity preferences) but isn't currently rendered — the
+// only personal page that previously existed (Personal Connectors) was
+// pulled because it was empty for nearly every user. It can come back
+// when there's a real reason for it.
+//
 // Profile is intentionally NOT in this nav — and it's also NOT under the
 // `/settings/*` tree at all. It lives at `/profile` (top-level) because
 // identity isn't a setting; it's a separate concern. The shell's
@@ -76,6 +82,13 @@ const PLATFORM_SECTIONS: PlatformSection[] = [
     minRole: "ws_member",
   },
   {
+    id: "ws-connectors",
+    label: "Connectors",
+    to: "/settings/workspace/connectors",
+    group: "workspace",
+    minRole: "ws_member",
+  },
+  {
     id: "ws-skills",
     label: "Skills",
     to: "/settings/workspace/skills",
@@ -104,6 +117,13 @@ const PLATFORM_SECTIONS: PlatformSection[] = [
     id: "org-users",
     label: "Users",
     to: "/settings/org/users",
+    group: "organization",
+    minRole: "org_admin",
+  },
+  {
+    id: "org-registries",
+    label: "Registries",
+    to: "/settings/org/registries",
     group: "organization",
     minRole: "org_admin",
   },

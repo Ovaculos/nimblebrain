@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import { callTool, getPlatformVersion } from "../../api/client";
 import { parseToolResult } from "../../api/tool-result";
 import { Badge } from "../../components/ui/badge";
@@ -42,6 +43,19 @@ function statusColor(status: string): "default" | "secondary" | "destructive" | 
   }
 }
 
+/**
+ * About — read-only platform info + the bundles installed on this
+ * instance.
+ *
+ * The bundle table duplicates data also visible in Settings →
+ * Workspace → Connectors. We keep both surfaces during the bake-in
+ * period for the new Connectors UX: About is a known-good fallback
+ * that doesn't depend on the new code paths (manage_connectors
+ * tool, registry abstraction, permission store), so if anything in
+ * Connectors regresses, operators have somewhere stable to verify
+ * "is my bundle actually running?". When Connectors is proven in
+ * production we'll re-remove this section — tracked separately.
+ */
 export function AboutTab() {
   const { version, buildSha } = getPlatformVersion();
   const [apps, setApps] = useState<AppInfo[]>([]);
@@ -87,6 +101,16 @@ export function AboutTab() {
       </Section>
 
       <Section title="Installed Bundles">
+        <p className="text-xs text-muted-foreground mb-3">
+          Read-only view. Manage installed bundles in{" "}
+          <Link
+            to="/settings/workspace/connectors"
+            className="text-primary underline-offset-4 hover:underline"
+          >
+            Settings → Workspace → Connectors
+          </Link>
+          .
+        </p>
         {loading ? (
           <p className="text-sm text-muted-foreground">Loading...</p>
         ) : bundlesError ? (

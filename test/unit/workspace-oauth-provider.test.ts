@@ -20,7 +20,7 @@ const CALLBACK = "http://localhost:27247/v1/mcp-auth/callback";
 
 function makeProvider(workDir: string, serverName = "test-srv"): WorkspaceOAuthProvider {
   return new WorkspaceOAuthProvider({
-    wsId: "ws_test",
+    owner: { type: "workspace", wsId: "ws_test" },
     serverName,
     workDir,
     callbackUrl: CALLBACK,
@@ -108,5 +108,587 @@ describe("WorkspaceOAuthProvider — file I/O roundtrips", () => {
   it("awaitPendingFlow without state() throws (no active flow)", async () => {
     const p = makeProvider(workDir);
     await expect(p.awaitPendingFlow()).rejects.toThrow(/no active flow/i);
+  });
+});
+
+describe("WorkspaceOAuthProvider — user-scoped persistence", () => {
+  let workDir: string;
+
+  beforeEach(() => {
+    workDir = mkdtempSync(join(tmpdir(), "nb-oauth-user-"));
+  });
+
+  function userProvider(userId: string, serverName = "test-srv"): WorkspaceOAuthProvider {
+    return new WorkspaceOAuthProvider({
+      owner: { type: "user", userId },
+      serverName,
+      workDir,
+      callbackUrl: CALLBACK,
+    });
+  }
+
+  it("rejects malformed user id at construction", () => {
+    expect(() => userProvider("../escape")).toThrow(/invalid owner id/);
+    expect(() => userProvider("with/slash")).toThrow(/invalid owner id/);
+    expect(() => userProvider("..")).toThrow(/invalid owner id/);
+    expect(() => userProvider(".")).toThrow(/invalid owner id/);
+    expect(() => userProvider("")).toThrow(/invalid owner id/);
+    expect(() => userProvider("a".repeat(129))).toThrow(/invalid owner id/);
+  });
+
+  it("tokens land under users/<userId>/ — entirely outside the workspaces tree", async () => {
+    const a = userProvider("usr_alice", "granola");
+    const tokens: OAuthTokens = { access_token: "alice-token", token_type: "Bearer" };
+    await a.saveTokens(tokens);
+
+    const userPath = join(
+      workDir,
+      "users",
+      "usr_alice",
+      "credentials",
+      "mcp-oauth",
+      "granola",
+      "tokens.json",
+    );
+    expect(JSON.parse(readFileSync(userPath, "utf-8"))).toEqual(tokens);
+
+    // Per-user tokens MUST NOT live under workspaces/. The whole point of
+    // user scope is "not workspace-bound" — leaking a tokens.json into
+    // the workspace tree would orphan it on workspace deletion.
+    const workspaceLevelPath = join(
+      workDir,
+      "workspaces",
+      "ws_test",
+      "credentials",
+      "mcp-oauth",
+      "granola",
+      "tokens.json",
+    );
+    expect(() => readFileSync(workspaceLevelPath)).toThrow();
+  });
+
+  it("two users store tokens independently — neither sees the other's", async () => {
+    const a = userProvider("usr_alice", "granola");
+    const b = userProvider("usr_bob", "granola");
+    await a.saveTokens({ access_token: "alice-token", token_type: "Bearer" });
+    await b.saveTokens({ access_token: "bob-token", token_type: "Bearer" });
+
+    // Fresh providers (no in-memory cache) read from disk.
+    const a2 = userProvider("usr_alice", "granola");
+    const b2 = userProvider("usr_bob", "granola");
+    expect((await a2.tokens())?.access_token).toBe("alice-token");
+    expect((await b2.tokens())?.access_token).toBe("bob-token");
+  });
+
+  it("client.json is per-user — each user's DCR registration is independent", async () => {
+    // Each user manages their own OAuth client identity ("Alice's
+    // NimbleBrain client", "Bob's NimbleBrain client") rather than
+    // sharing a workspace-level registration. This is correct OAuth
+    // semantics for personal-scope: my Granola is mine.
+    const a = userProvider("usr_alice", "granola");
+    const aliceInfo: OAuthClientInformationFull = {
+      client_id: "cid-alice",
+      redirect_uris: [CALLBACK],
+    };
+    await a.saveClientInformation(aliceInfo);
+
+    const b = userProvider("usr_bob", "granola");
+    const bobInfo: OAuthClientInformationFull = {
+      client_id: "cid-bob",
+      redirect_uris: [CALLBACK],
+    };
+    await b.saveClientInformation(bobInfo);
+
+    // Each user's client.json is read back independently.
+    const a2 = userProvider("usr_alice", "granola");
+    const b2 = userProvider("usr_bob", "granola");
+    expect((await a2.clientInformation())?.client_id).toBe("cid-alice");
+    expect((await b2.clientInformation())?.client_id).toBe("cid-bob");
+
+    // On disk: each lives under its own user directory.
+    const aPath = join(
+      workDir,
+      "users",
+      "usr_alice",
+      "credentials",
+      "mcp-oauth",
+      "granola",
+      "client.json",
+    );
+    expect(JSON.parse(readFileSync(aPath, "utf-8"))).toEqual(aliceInfo);
+  });
+
+  it("invalidateCredentials('tokens') only clears the calling user's tokens", async () => {
+    const a = userProvider("usr_alice", "granola");
+    const b = userProvider("usr_bob", "granola");
+    await a.saveTokens({ access_token: "alice-token", token_type: "Bearer" });
+    await b.saveTokens({ access_token: "bob-token", token_type: "Bearer" });
+
+    await a.invalidateCredentials("tokens");
+
+    const a2 = userProvider("usr_alice", "granola");
+    const b2 = userProvider("usr_bob", "granola");
+    expect(await a2.tokens()).toBeUndefined();
+    expect((await b2.tokens())?.access_token).toBe("bob-token");
+  });
+
+  it("getOwner returns the user-scope owner for user providers", () => {
+    expect(userProvider("usr_alice").getOwner()).toEqual({
+      type: "user",
+      userId: "usr_alice",
+    });
+    expect(makeProvider(workDir).getOwner()).toEqual({ type: "workspace", wsId: "ws_test" });
+  });
+});
+
+describe("WorkspaceOAuthProvider — Track A: pre-registered client + scopes + extra params", () => {
+  let workDir: string;
+
+  beforeEach(() => {
+    workDir = mkdtempSync(join(tmpdir(), "nb-oauth-trackA-"));
+  });
+
+  it("clientInformation returns the static client when staticClient is set; saveClientInformation is a no-op", async () => {
+    const p = new WorkspaceOAuthProvider({
+      owner: { type: "workspace", wsId: "ws_test" },
+      serverName: "hubspot",
+      workDir,
+      callbackUrl: CALLBACK,
+      staticClient: {
+        clientId: "static-cid",
+        clientSecret: "static-secret",
+        tokenEndpointAuthMethod: "client_secret_post",
+      },
+    });
+    const info = await p.clientInformation();
+    expect(info).toMatchObject({
+      client_id: "static-cid",
+      client_secret: "static-secret",
+      redirect_uris: [CALLBACK],
+    });
+
+    // Stray DCR-style save MUST NOT overwrite client.json.
+    await p.saveClientInformation({
+      client_id: "should-not-persist",
+      redirect_uris: [CALLBACK],
+    });
+    const stillStatic = await p.clientInformation();
+    expect(stillStatic?.client_id).toBe("static-cid");
+
+    // No client.json on disk either.
+    const onDiskPath = join(
+      workDir,
+      "workspaces",
+      "ws_test",
+      "credentials",
+      "mcp-oauth",
+      "hubspot",
+      "client.json",
+    );
+    expect(() => readFileSync(onDiskPath)).toThrow();
+  });
+
+  it("clientMetadata.scope reflects the configured scopes (space-joined per RFC 6749)", () => {
+    const p = new WorkspaceOAuthProvider({
+      owner: { type: "workspace", wsId: "ws_test" },
+      serverName: "gmail",
+      workDir,
+      callbackUrl: CALLBACK,
+      scopes: [
+        "https://www.googleapis.com/auth/gmail.readonly",
+        "https://www.googleapis.com/auth/gmail.send",
+      ],
+    });
+    expect(p.clientMetadata.scope).toBe(
+      "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send",
+    );
+  });
+
+  it("clientMetadata default token_endpoint_auth_method = 'none' (DCR PKCE-only) when no staticClient", () => {
+    const p = new WorkspaceOAuthProvider({
+      owner: { type: "workspace", wsId: "ws_test" },
+      serverName: "granola",
+      workDir,
+      callbackUrl: CALLBACK,
+    });
+    expect(p.clientMetadata.token_endpoint_auth_method).toBe("none");
+  });
+
+  it("clientMetadata default token_endpoint_auth_method = 'client_secret_post' when secret provided without override", () => {
+    const p = new WorkspaceOAuthProvider({
+      owner: { type: "workspace", wsId: "ws_test" },
+      serverName: "hubspot",
+      workDir,
+      callbackUrl: CALLBACK,
+      staticClient: { clientId: "c", clientSecret: "s" },
+    });
+    expect(p.clientMetadata.token_endpoint_auth_method).toBe("client_secret_post");
+  });
+
+  it("explicit tokenEndpointAuthMethod override wins", () => {
+    const p = new WorkspaceOAuthProvider({
+      owner: { type: "workspace", wsId: "ws_test" },
+      serverName: "weird-vendor",
+      workDir,
+      callbackUrl: CALLBACK,
+      staticClient: {
+        clientId: "c",
+        clientSecret: "s",
+        tokenEndpointAuthMethod: "client_secret_basic",
+      },
+    });
+    expect(p.clientMetadata.token_endpoint_auth_method).toBe("client_secret_basic");
+  });
+
+  it("constructor rejects reserved keys in additionalAuthorizationParams", () => {
+    const make = (extras: Record<string, string>) =>
+      () =>
+        new WorkspaceOAuthProvider({
+          owner: { type: "workspace", wsId: "ws_test" },
+          serverName: "broken",
+          workDir,
+          callbackUrl: CALLBACK,
+          additionalAuthorizationParams: extras,
+        });
+
+    expect(make({ client_id: "evil" })).toThrow(/reserved keys/);
+    expect(make({ state: "no" })).toThrow(/reserved keys/);
+    expect(make({ scope: "more" })).toThrow(/reserved keys/);
+    expect(make({ code_challenge: "bypass" })).toThrow(/reserved keys/);
+  });
+
+  it("redirectToAuthorization appends additionalAuthorizationParams to the authorize URL", async () => {
+    // Use a Bun-served mock to verify the URL the provider tries to fetch.
+    // Test asserts the built URL by inspecting the deferred-thrown
+    // UnauthorizedError's message, which carries `url.origin`. For full
+    // URL-shape verification we use a different angle: spy on fetch by
+    // wrapping global fetch via a closure-captured array. To keep the
+    // test simple and avoid Bun.serve, we just construct the URL the
+    // SDK would build and call redirectToAuthorization directly with a
+    // controlled `state`, then read the URL back from the captured
+    // fetch call's URL parameter.
+    const calls: string[] = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const u = typeof url === "string" ? url : url.toString();
+      calls.push(u);
+      // Force the headless probe to fail (200 response with no Location)
+      // so the provider falls through to the interactive branch.
+      return new Response("not a redirect", { status: 200 });
+    }) as typeof fetch;
+    try {
+      const p = new WorkspaceOAuthProvider({
+        owner: { type: "workspace", wsId: "ws_test" },
+        serverName: "google",
+        workDir,
+        callbackUrl: CALLBACK,
+        allowInsecureRemotes: true,
+        additionalAuthorizationParams: {
+          access_type: "offline",
+          prompt: "consent",
+        },
+      });
+      const state = p.state();
+      const authUrl = new URL("http://localhost:39991/oauth/authorize");
+      authUrl.searchParams.set("state", state);
+      try {
+        await p.redirectToAuthorization(authUrl);
+      } catch {
+        // expected — UnauthorizedError on interactive branch
+      }
+      // The URL passed to fetch (after our params were appended) should
+      // contain access_type and prompt.
+      const fetched = calls[0] ?? "";
+      expect(fetched).toContain("access_type=offline");
+      expect(fetched).toContain("prompt=consent");
+      expect(fetched).toContain(`state=${state}`);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+});
+
+describe("WorkspaceOAuthProvider — revokeAndDeleteTokens", () => {
+  let workDir: string;
+
+  beforeEach(() => {
+    workDir = mkdtempSync(join(tmpdir(), "nb-oauth-rev-"));
+  });
+
+  /** Build a fake fetch that records calls + returns programmable responses. */
+  function makeFetcher(
+    responses: Record<string, { status: number; body?: unknown }>,
+  ): { fetch: typeof fetch; calls: Array<{ url: string; init?: RequestInit }> } {
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const fetcher = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = typeof url === "string" ? url : url.toString();
+      calls.push({ url: u, init });
+      const r = responses[u];
+      if (!r) return new Response(null, { status: 404 });
+      const body = r.body !== undefined ? JSON.stringify(r.body) : null;
+      return new Response(body, {
+        status: r.status,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as unknown as typeof fetch;
+    return { fetch: fetcher, calls };
+  }
+
+  it("returns no-op result when no tokens are stored", async () => {
+    const p = new WorkspaceOAuthProvider({
+      owner: { type: "workspace", wsId: "ws_test" },
+      serverName: "granola",
+      workDir,
+      callbackUrl: CALLBACK,
+    });
+    const { fetch: f, calls } = makeFetcher({});
+    const result = await p.revokeAndDeleteTokens({
+      bundleUrl: "https://mcp.granola.test/mcp",
+      fetchImpl: f,
+    });
+    expect(result.deletedLocal).toBe(true);
+    expect(result.revoked).toEqual({});
+    // No revocation discovery attempted when there are no tokens.
+    expect(calls.length).toBe(0);
+  });
+
+  it("revokes refresh + access via discovered endpoint, then deletes locally", async () => {
+    const p = new WorkspaceOAuthProvider({
+      owner: { type: "workspace", wsId: "ws_test" },
+      serverName: "granola",
+      workDir,
+      callbackUrl: CALLBACK,
+      allowInsecureRemotes: true,
+    });
+    await p.saveClientInformation({ client_id: "test-client", redirect_uris: [CALLBACK] });
+    await p.saveTokens({
+      access_token: "acc-tok",
+      token_type: "Bearer",
+      refresh_token: "ref-tok",
+    });
+
+    const bundleUrl = "http://localhost:39990/mcp";
+    const { fetch: f, calls } = makeFetcher({
+      "http://localhost:39990/.well-known/oauth-authorization-server": {
+        status: 200,
+        body: {
+          revocation_endpoint: "http://localhost:39990/oauth/revoke",
+        },
+      },
+      "http://localhost:39990/oauth/revoke": { status: 200 },
+    });
+
+    const result = await p.revokeAndDeleteTokens({ bundleUrl, fetchImpl: f });
+    expect(result.deletedLocal).toBe(true);
+    expect(result.revoked.refresh).toBe(true);
+    expect(result.revoked.access).toBe(true);
+    // Discovery probes RFC 9728 (/.well-known/oauth-protected-resource —
+    // not in fake → 404) then RFC 8414 fallback (/.well-known/oauth-
+    // authorization-server — in fake), then 2 revoke calls = 4 total.
+    expect(calls.length).toBe(4);
+
+    // Both revoke calls are POSTs with x-www-form-urlencoded
+    const revokeCalls = calls.filter((c) => c.url.endsWith("/oauth/revoke"));
+    expect(revokeCalls.length).toBe(2);
+    for (const r of revokeCalls) {
+      expect(r.init?.method).toBe("POST");
+      const headers = r.init?.headers as Record<string, string>;
+      expect(headers["Content-Type"]).toBe("application/x-www-form-urlencoded");
+      expect(String(r.init?.body)).toContain("client_id=test-client");
+    }
+
+    // Verify local files are gone.
+    const p2 = new WorkspaceOAuthProvider({
+      owner: { type: "workspace", wsId: "ws_test" },
+      serverName: "granola",
+      workDir,
+      callbackUrl: CALLBACK,
+    });
+    expect(await p2.tokens()).toBeUndefined();
+  });
+
+  it("deletes local tokens even when revocation endpoint discovery fails", async () => {
+    const p = new WorkspaceOAuthProvider({
+      owner: { type: "workspace", wsId: "ws_test" },
+      serverName: "granola",
+      workDir,
+      callbackUrl: CALLBACK,
+      allowInsecureRemotes: true,
+    });
+    await p.saveClientInformation({ client_id: "test-client", redirect_uris: [CALLBACK] });
+    await p.saveTokens({ access_token: "acc-tok", token_type: "Bearer" });
+
+    // Metadata endpoint 404s → no revocation_endpoint → skip revoke, still delete locally.
+    const { fetch: f } = makeFetcher({});
+    const result = await p.revokeAndDeleteTokens({
+      bundleUrl: "http://localhost:39990/mcp",
+      fetchImpl: f,
+    });
+    expect(result.deletedLocal).toBe(true);
+    expect(result.revoked).toEqual({});
+
+    const p2 = new WorkspaceOAuthProvider({
+      owner: { type: "workspace", wsId: "ws_test" },
+      serverName: "granola",
+      workDir,
+      callbackUrl: CALLBACK,
+    });
+    expect(await p2.tokens()).toBeUndefined();
+  });
+
+  it("captures OIDC id_token claims to identity.json on saveTokens", async () => {
+    const p = new WorkspaceOAuthProvider({
+      owner: { type: "workspace", wsId: "ws_test" },
+      serverName: "google",
+      workDir,
+      callbackUrl: CALLBACK,
+    });
+    // Build a fake JWT — the parser only cares about the payload segment.
+    const header = btoa(JSON.stringify({ alg: "RS256", typ: "JWT" })).replace(/=/g, "");
+    const payload = btoa(
+      JSON.stringify({
+        sub: "1234567890",
+        email: "mat@nimblebrain.ai",
+        name: "Mat Goldsborough",
+        iss: "https://accounts.google.com",
+        aud: "test-client",
+      }),
+    ).replace(/=/g, "");
+    const fakeIdToken = `${header}.${payload}.fakesig`;
+
+    await p.saveTokens({
+      access_token: "acc",
+      token_type: "Bearer",
+      // biome-ignore lint/suspicious/noExplicitAny: id_token is an OIDC extension on OAuthTokens
+      id_token: fakeIdToken,
+    } as any);
+
+    const identity = await p.identity();
+    expect(identity).toEqual({
+      sub: "1234567890",
+      email: "mat@nimblebrain.ai",
+      name: "Mat Goldsborough",
+    });
+  });
+
+  it("identity() returns null when no id_token was issued", async () => {
+    const p = new WorkspaceOAuthProvider({
+      owner: { type: "workspace", wsId: "ws_test" },
+      serverName: "no-oidc",
+      workDir,
+      callbackUrl: CALLBACK,
+    });
+    await p.saveTokens({ access_token: "acc", token_type: "Bearer" });
+    expect(await p.identity()).toBeNull();
+  });
+
+  it("invalidateCredentials('tokens') also removes identity.json", async () => {
+    const p = new WorkspaceOAuthProvider({
+      owner: { type: "workspace", wsId: "ws_test" },
+      serverName: "google",
+      workDir,
+      callbackUrl: CALLBACK,
+    });
+    const header = btoa(JSON.stringify({ alg: "RS256" })).replace(/=/g, "");
+    const payload = btoa(JSON.stringify({ sub: "x", email: "x@y.z" })).replace(/=/g, "");
+    await p.saveTokens({
+      access_token: "a",
+      token_type: "Bearer",
+      // biome-ignore lint/suspicious/noExplicitAny: id_token extension
+      id_token: `${header}.${payload}.s`,
+    } as any);
+    expect(await p.identity()).not.toBeNull();
+    await p.invalidateCredentials("tokens");
+    expect(await p.identity()).toBeNull();
+  });
+
+  it("malformed id_token does not break saveTokens", async () => {
+    const p = new WorkspaceOAuthProvider({
+      owner: { type: "workspace", wsId: "ws_test" },
+      serverName: "broken",
+      workDir,
+      callbackUrl: CALLBACK,
+    });
+    // Not enough segments → parser returns null, identity not written, no throw.
+    await p.saveTokens({
+      access_token: "a",
+      token_type: "Bearer",
+      // biome-ignore lint/suspicious/noExplicitAny: malformed id_token
+      id_token: "not.a.jwt.at.all",
+    } as any);
+    expect(await p.identity()).toBeNull();
+    expect((await p.tokens())?.access_token).toBe("a");
+  });
+
+  it("RFC 9728: discovers AS at a different origin via oauth-protected-resource", async () => {
+    // Mimics Google: bundle at gmailmcp.googleapis.com but AS at
+    // oauth2.googleapis.com. The protected-resource metadata points at
+    // the AS origin; we then fetch the AS's authorization-server metadata
+    // for the revocation_endpoint.
+    const p = new WorkspaceOAuthProvider({
+      owner: { type: "workspace", wsId: "ws_test" },
+      serverName: "gmail",
+      workDir,
+      callbackUrl: CALLBACK,
+      allowInsecureRemotes: true,
+    });
+    await p.saveClientInformation({ client_id: "g-client", redirect_uris: [CALLBACK] });
+    await p.saveTokens({
+      access_token: "g-access",
+      token_type: "Bearer",
+      refresh_token: "g-refresh",
+    });
+
+    // Bundle origin: localhost:39990. AS origin: localhost:39991.
+    const bundleUrl = "http://localhost:39990/mcp/v1";
+    const { fetch: f, calls } = makeFetcher({
+      "http://localhost:39990/.well-known/oauth-protected-resource": {
+        status: 200,
+        body: { authorization_servers: ["http://localhost:39991/"] },
+      },
+      "http://localhost:39991/.well-known/oauth-authorization-server": {
+        status: 200,
+        body: { revocation_endpoint: "http://localhost:39991/oauth/revoke" },
+      },
+      "http://localhost:39991/oauth/revoke": { status: 200 },
+    });
+
+    const result = await p.revokeAndDeleteTokens({ bundleUrl, fetchImpl: f });
+    expect(result.revoked.refresh).toBe(true);
+    expect(result.revoked.access).toBe(true);
+    // 1 PR metadata + 1 AS metadata + 2 revoke = 4 calls.
+    expect(calls.length).toBe(4);
+    // Revocation hit the OTHER origin, not the bundle origin.
+    expect(calls.some((c) => c.url === "http://localhost:39991/oauth/revoke")).toBe(true);
+  });
+
+  it("treats RFC 7009 invalid_token 400 as success", async () => {
+    const p = new WorkspaceOAuthProvider({
+      owner: { type: "workspace", wsId: "ws_test" },
+      serverName: "granola",
+      workDir,
+      callbackUrl: CALLBACK,
+      allowInsecureRemotes: true,
+    });
+    await p.saveClientInformation({ client_id: "c1", redirect_uris: [CALLBACK] });
+    await p.saveTokens({ access_token: "a", token_type: "Bearer", refresh_token: "r" });
+
+    const { fetch: f } = makeFetcher({
+      "http://localhost:39990/.well-known/oauth-authorization-server": {
+        status: 200,
+        body: { revocation_endpoint: "http://localhost:39990/oauth/revoke" },
+      },
+      "http://localhost:39990/oauth/revoke": {
+        status: 400,
+        body: { error: "invalid_token" },
+      },
+    });
+    const result = await p.revokeAndDeleteTokens({
+      bundleUrl: "http://localhost:39990/mcp",
+      fetchImpl: f,
+    });
+    expect(result.revoked.refresh).toBe(true);
+    expect(result.revoked.access).toBe(true);
+    expect(result.deletedLocal).toBe(true);
   });
 });

@@ -22,7 +22,7 @@ function makeProvider(
   overrides: { serverName?: string; callbackUrl?: string; allowInsecureRemotes?: boolean } = {},
 ): WorkspaceOAuthProvider {
   return new WorkspaceOAuthProvider({
-    wsId: "ws_test",
+    owner: { type: "workspace", wsId: "ws_test" },
     serverName: overrides.serverName ?? "test-srv",
     workDir,
     callbackUrl: overrides.callbackUrl ?? CALLBACK,
@@ -165,7 +165,7 @@ describe("WorkspaceOAuthProvider — authorize redirect probe (interactive)", ()
       const authUrl = new URL(`http://localhost:${mockAuthServer.port}/authorize`);
       const callbackUrls: string[] = [];
       const p = new WorkspaceOAuthProvider({
-        wsId: "ws_test",
+        owner: { type: "workspace", wsId: "ws_test" },
         serverName: "test-srv",
         workDir,
         callbackUrl: CALLBACK,
@@ -187,8 +187,7 @@ describe("WorkspaceOAuthProvider — authorize redirect probe (interactive)", ()
       // Flow is registered with the registry; resolving via callback
       // resolves the awaitPendingFlow promise.
       const pending = p.awaitPendingFlow();
-      const resolved = resolveWithCode(state, "the-code-123");
-      expect(resolved).toBe(true);
+      expect(resolveWithCode(state, "the-code-123")).toBe(true);
       expect(await pending).toBe("the-code-123");
     } finally {
       mockAuthServer.stop(true);
@@ -209,7 +208,7 @@ describe("WorkspaceOAuthProvider — authorize redirect probe (interactive)", ()
       const authUrl = new URL(`http://localhost:${mockAuthServer.port}/authorize`);
       let captured: string | null = null;
       const p = new WorkspaceOAuthProvider({
-        wsId: "ws_test",
+        owner: { type: "workspace", wsId: "ws_test" },
         serverName: "test-srv",
         workDir,
         callbackUrl: CALLBACK,
