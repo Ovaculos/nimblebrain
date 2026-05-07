@@ -499,6 +499,42 @@ export const refreshSession = refreshInterceptor.tryRefresh;
 // Auth (session persistence)
 // ---------------------------------------------------------------------------
 
+/**
+ * Initiate an interactive OAuth flow for a remote URL bundle that's in
+ * `pending_auth`. Sets a session-bound `nb_oauth_state` cookie scoped
+ * to `/v1/mcp-auth/callback` and returns the authorization URL the
+ * caller must navigate the user's browser to (typically via
+ * `window.location.assign(authorizationUrl)`).
+ *
+ * Pairs with the workspace's pending-auth banner — clicking "Connect"
+ * calls this, then redirects.
+ */
+export async function initiateMcpOAuth(
+  serverName: string,
+  principalId?: string,
+): Promise<{ authorizationUrl: string }> {
+  return request<{ authorizationUrl: string }>("/v1/mcp-auth/initiate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(principalId ? { serverName, principalId } : { serverName }),
+  });
+}
+
+/**
+ * Snapshot of Connections in pending_auth for the active workspace.
+ * The web banner fetches this on workspace render so it appears even if
+ * the bundle entered pending_auth before the SSE stream connected
+ * (typical for boot-time URL bundles). Subsequent state changes flow
+ * through SSE.
+ */
+export async function listPendingConnections(): Promise<{
+  connections: Array<{ serverName: string; bundleName: string; principalId: string }>;
+}> {
+  return request<{
+    connections: Array<{ serverName: string; bundleName: string; principalId: string }>;
+  }>("/v1/connections/pending");
+}
+
 /** Clear the server-side session cookie. Fails silently on error. */
 export async function logout(): Promise<void> {
   try {

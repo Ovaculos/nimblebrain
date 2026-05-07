@@ -5,7 +5,7 @@ export interface BundleUiMeta {
 }
 
 /** Bundle lifecycle states. */
-export type BundleState = "starting" | "running" | "crashed" | "dead" | "stopped";
+export type BundleState = "starting" | "running" | "crashed" | "dead" | "stopped" | "pending_auth";
 
 /** App info returned by GET /v1/apps. */
 export interface AppInfo {
@@ -102,7 +102,12 @@ export interface HealthInfo {
 
 // --- SSE Event Types ---
 
+// All bundle.* events are workspace-scoped at the SSE layer (server filters
+// by wsId before fan-out). The wsId is included on the payload so consumers
+// can disambiguate when they hold state across multiple workspace sessions.
+
 export interface BundleInstalledEvent {
+  wsId: string;
   name: string;
   bundleName: string;
   status: BundleState;
@@ -110,21 +115,37 @@ export interface BundleInstalledEvent {
 }
 
 export interface BundleUninstalledEvent {
+  wsId: string;
   name: string;
 }
 
 export interface BundleCrashedEvent {
+  wsId: string;
   name: string;
   restartAttempt: number;
 }
 
 export interface BundleRecoveredEvent {
+  wsId: string;
   name: string;
 }
 
 export interface BundleDeadEvent {
+  wsId: string;
   name: string;
   message: string;
+}
+
+export interface ConnectionStateChangedEvent {
+  wsId: string;
+  serverName: string;
+  bundleName: string;
+  principalId: string;
+  state: BundleState;
+  /** Populated only when state === "pending_auth". */
+  authorizationUrl?: string;
+  /** Populated when state === "dead" or "crashed". */
+  lastError?: string;
 }
 
 export interface DataChangedEvent {
@@ -149,6 +170,7 @@ export interface SseEventMap {
   "bundle.crashed": BundleCrashedEvent;
   "bundle.recovered": BundleRecoveredEvent;
   "bundle.dead": BundleDeadEvent;
+  "connection.state_changed": ConnectionStateChangedEvent;
   "data.changed": DataChangedEvent;
   "config.changed": ConfigChangedEvent;
   heartbeat: HeartbeatEvent;
