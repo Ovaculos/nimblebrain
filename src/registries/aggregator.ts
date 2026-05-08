@@ -48,8 +48,9 @@ export class DirectoryAggregator {
       }
     }
 
-    // De-dupe on (registryId, id) — registries can repeat ids of
-    // their own so the composite key is the only safe primary.
+    // Within-registry dedup: a registry can occasionally repeat its
+    // own ids (config error, duplicate in a fetched response).
+    // Composite (registryId, id) keeps the first occurrence.
     const seen = new Set<string>();
     const deduped: DirectoryEntry[] = [];
     for (const e of entries) {

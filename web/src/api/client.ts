@@ -547,6 +547,22 @@ export interface ConnectorCatalogEntry {
 }
 
 /**
+ * Bundle `user_config` field descriptor as declared in the bundle's
+ * manifest. Mirrors the server's `UserConfigFieldDef` — kept in sync by
+ * convention because the server forwards manifest declarations
+ * unchanged. Only `string` types appear in production today; the modal
+ * renders any unknown type as disabled with a console warning.
+ */
+export interface BundleUserConfigField {
+  type: string;
+  title?: string;
+  description?: string;
+  sensitive?: boolean;
+  required?: boolean;
+  default?: unknown;
+}
+
+/**
  * Per-(scope, principal) installed view. Returns every bundle visible
  * in the workspace (or user) — local stdio servers, local URL bundles,
  * Synapse apps, and remote OAuth connectors. `type` distinguishes
@@ -570,6 +586,46 @@ export interface InstalledConnector {
   authorizationUrl?: string;
   identity?: { sub?: string; email?: string; name?: string };
   missingOperatorSetup?: boolean;
+  /** Last connection error for crashed / dead / reauth_required states. */
+  lastError?: string;
+  /**
+   * Operator OAuth client config — present only for static-auth
+   * connectors the workspace has configured. The Configure page reads
+   * this to render the audit line + Edit affordance. Secret never
+   * appears here.
+   */
+  operatorOAuth?: {
+    clientId: string;
+    configuredAt: string;
+    configuredBy: string;
+    /** Best-effort display name/email for configuredBy. */
+    configuredByLabel?: string;
+  };
+  /**
+   * Stdio bundle credential schema + per-field populated probe. The
+   * Configure page's bundle-config section renders the schema and
+   * uses `populated` to display configured / not-configured per row.
+   * Values are never echoed.
+   */
+  userConfig?: {
+    schema: Record<string, BundleUserConfigField>;
+    populated: Record<string, boolean>;
+  };
+  /**
+   * Generic, type-agnostic UI status. Derived server-side from the
+   * underlying BundleState + credential probes so list-page pills,
+   * detail-page hero, and any future surface read one value.
+   *
+   *   ready          — works
+   *   needs_setup    — admin must configure (operator OAuth or user_config)
+   *   needs_auth     — workspace member must (re)authenticate
+   *   connecting     — OAuth flow in flight
+   *   failed         — crashed / dead, no actionable next step
+   *   starting       — subprocess booting
+   */
+  status: "ready" | "needs_setup" | "needs_auth" | "connecting" | "failed" | "starting";
+  /** Human-readable detail for `status` (tooltip / banner copy). */
+  statusReason?: string;
 }
 
 /**
@@ -593,11 +649,6 @@ function unwrapStructured<T>(result: ToolCallResult, what: string): T {
   return result.structuredContent as T;
 }
 
-export async function getConnectorsCatalog(): Promise<{ catalog: ConnectorCatalogEntry[] }> {
-  const result = await callTool("nb", "manage_connectors", { action: "list_catalog" });
-  return unwrapStructured(result, "list_catalog");
-}
-
 export async function getInstalledConnectors(opts?: {
   scope?: "all" | "workspace" | "user";
 }): Promise<{ installed: InstalledConnector[] }> {
@@ -606,6 +657,22 @@ export async function getInstalledConnectors(opts?: {
     scope: opts?.scope ?? "all",
   });
   return unwrapStructured(result, "list_installed");
+}
+
+/**
+ * Single-connector counterpart to {@link getInstalledConnectors}.
+ * Returns one entry by serverName, or null if not installed in the
+ * caller's scope. Saves the wire weight + server work of building
+ * entries for every other connector when you only need one.
+ */
+export async function getInstalledConnector(
+  serverName: string,
+): Promise<{ installed: InstalledConnector | null }> {
+  const result = await callTool("nb", "manage_connectors", {
+    action: "get_installed",
+    serverName,
+  });
+  return unwrapStructured(result, "get_installed");
 }
 
 export async function disconnectConnector(
@@ -644,12 +711,13 @@ export async function uninstallConnector(
 }
 
 /**
- * Install a catalog entry. Routes to user-scope or workspace-scope
- * storage based on the catalog entry's `defaultScope`. Idempotent —
- * if already installed, returns `alreadyInstalled: true`. Does NOT
- * start OAuth — caller follows up with `initiateMcpOAuth(serverName)`.
+ * Install a connector. Pass the full `DirectoryEntry` the user
+ * clicked — server dispatches by `entry.install.kind`. Idempotent;
+ * already-installed connectors return `alreadyInstalled: true`.
+ * Does NOT start OAuth — caller follows up with
+ * `initiateMcpOAuth(serverName)` for remote-OAuth installs.
  */
-export async function installConnector(catalogId: string): Promise<{
+export async function installConnector(entry: DirectoryEntry): Promise<{
   ok: boolean;
   alreadyInstalled: boolean;
   serverName: string;
@@ -657,7 +725,7 @@ export async function installConnector(catalogId: string): Promise<{
 }> {
   const result = await callTool("nb", "manage_connectors", {
     action: "install",
-    catalogId,
+    entry,
   });
   return unwrapStructured(result, "install");
 }
@@ -697,7 +765,7 @@ export interface DirectoryEntry {
         additionalAuthorizationParams?: Record<string, string>;
         operatorSetup?: { portalUrl: string; hint: string; clientSecretKey: string };
       }
-    | { kind: "mpak-bundle"; package: string; version?: string; mpakUrl?: string }
+    | { kind: "mpak-bundle"; package: string }
     | { kind: "direct-url"; url: string };
 }
 
@@ -730,14 +798,76 @@ export async function setupConnectorOperator(
   return unwrapStructured(result, "setup_operator");
 }
 
-export async function removeConnectorOperatorSetup(
-  catalogId: string,
-): Promise<{ ok: boolean; catalogId: string }> {
+/**
+ * Result envelope for set/clear bundle user_config calls. The
+ * credential write itself is reported via `ok` + `populated`; the
+ * implicit subprocess respawn that picks up the new env is reported
+ * separately under `respawn` so the UI can surface a partial-success
+ * state (creds saved, but bundle didn't come back up).
+ */
+export interface BundleUserConfigResult {
+  ok: boolean;
+  serverName: string;
+  populated: Record<string, boolean>;
+  respawn: { ok: boolean; error?: string };
+}
+
+/**
+ * Set or clear individual `user_config` fields on a stdio bundle. Empty
+ * string clears one field; absent fields are unchanged. Returns the
+ * post-write `populated` map so the caller can refresh UI state without
+ * a follow-up list_installed round-trip.
+ *
+ * Saving credentials triggers an automatic subprocess respawn so the
+ * new env takes effect immediately — Mode 1 (env_inject) bundles
+ * otherwise need a platform restart to pick up new values.
+ */
+export async function setBundleUserConfig(
+  serverName: string,
+  fields: Record<string, string>,
+): Promise<BundleUserConfigResult> {
   const result = await callTool("nb", "manage_connectors", {
-    action: "remove_operator_setup",
-    catalogId,
+    action: "set_user_config",
+    serverName,
+    fields,
   });
-  return unwrapStructured(result, "remove_operator_setup");
+  return unwrapStructured(result, "set_user_config");
+}
+
+/**
+ * Drop the entire workspace credential file for a stdio bundle. Every
+ * declared field reverts to not-configured. Triggers an automatic
+ * Important caveat — the running subprocess is **not** restarted.
+ * Clearing on a bundle with required fields would orphan the
+ * connector (respawn would fail at prepareServer and the workspace
+ * registry would lose the source, taking the connector off the UI),
+ * so the server intentionally only zeroes the disk file. The bundle
+ * keeps serving requests with whatever env it was launched with
+ * until the next platform restart. Surface this to operators as
+ * "credential rotated, takes effect next deploy" — it's not the same
+ * as immediate revocation. (Active follow-up to give admins an
+ * explicit Stop affordance for hard-revocation cases.)
+ */
+export async function clearBundleUserConfig(serverName: string): Promise<BundleUserConfigResult> {
+  const result = await callTool("nb", "manage_connectors", {
+    action: "clear_user_config",
+    serverName,
+  });
+  return unwrapStructured(result, "clear_user_config");
+}
+
+/**
+ * The exact redirect URI the platform sends to vendor OAuth servers.
+ * OperatorSetupModal shows this to admins so they can register the
+ * same value in the vendor's OAuth app config; a mismatch yields a
+ * vendor-side `redirect_uri does not match` error after the user is
+ * already redirected away.
+ */
+export async function getOAuthRedirectUri(): Promise<{ redirectUri: string }> {
+  const result = await callTool("nb", "manage_connectors", {
+    action: "get_redirect_uri",
+  });
+  return unwrapStructured(result, "get_redirect_uri");
 }
 
 export interface RegistryConfig {
@@ -773,30 +903,29 @@ export async function setRegistryUrl(
   return unwrapStructured(result, "set_url");
 }
 
-export async function listConnectorTools(
+export type ToolPolicy = "allow" | "disallow";
+
+/**
+ * Combined fetch — returns the connector's tool list AND the policy
+ * map in one round-trip. Used by ToolPermissionsTable, which needs
+ * both on mount; the previous two-call shape doubled the page-load
+ * REST traffic for no benefit.
+ */
+export async function listConnectorToolsWithPermissions(
   serverName: string,
   scope?: "workspace" | "user",
-): Promise<{ tools: ConnectorTool[] }> {
+): Promise<{
+  scope: "workspace" | "user";
+  serverName: string;
+  tools: ConnectorTool[];
+  permissions: Record<string, ToolPolicy>;
+}> {
   const result = await callTool("nb", "manage_connectors", {
-    action: "list_tools",
+    action: "list_tools_with_permissions",
     serverName,
     ...(scope ? { scope } : {}),
   });
-  return unwrapStructured(result, "list_tools");
-}
-
-export type ToolPolicy = "allow" | "disallow";
-
-export async function getConnectorPermissions(
-  serverName: string,
-  scope: "workspace" | "user",
-): Promise<{ scope: "workspace" | "user"; serverName: string; tools: Record<string, ToolPolicy> }> {
-  const result = await callTool("nb", "manage_connectors", {
-    action: "get_permissions",
-    serverName,
-    scope,
-  });
-  return unwrapStructured(result, "get_permissions");
+  return unwrapStructured(result, "list_tools_with_permissions");
 }
 
 export async function setConnectorPermissions(

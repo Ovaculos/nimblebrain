@@ -1,23 +1,40 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import {
-  getInstalledConnectors,
-  initiateMcpOAuth,
+  getInstalledConnector,
   type InstalledConnector,
   uninstallConnector,
 } from "../../api/client";
+import { BundleCredentialsModal } from "../../components/connectors/BundleCredentialsModal";
+import { ConnectorStatusHero } from "../../components/connectors/ConnectorStatusHero";
+import { OAuthConnectionSection } from "../../components/connectors/OAuthConnectionSection";
+import { OperatorOAuthSection } from "../../components/connectors/OperatorOAuthSection";
 import { ToolPermissionsTable } from "../../components/connectors/ToolPermissionsTable";
+import { roleAtLeast, useScopedRole } from "../../hooks/useScopedRole";
 
 /**
- * Per-connector Configure detail page. Reachable from both
- * /settings/personal/connectors/:serverName and
- * /settings/workspace/connectors/:serverName — the scope is determined
- * by the route prefix.
+ * Per-connector Configure page. The visual hierarchy is driven by
+ * `installed.status` — a generic UI status the server derives from
+ * the underlying BundleState + credential probes:
  *
- * Layout: centered single column, no card chrome — sections separated
- * by spacing alone. Top-right action bar holds the destructive
- * Uninstall plus an optional Docs link. Reauth and per-tool
- * permissions sit inline.
+ *   - The hero block carries the page's primary CTA (Configure /
+ *     Set up OAuth / Connect / Reconnect) when status ≠ ready, and
+ *     fades to just the title block when ready.
+ *
+ *   - The action bar (top-right) groups secondary management
+ *     affordances: Docs, Configure (when stdio bundle has a
+ *     `user_config` schema and status is ready — the hero owns
+ *     `needs_setup`), and Uninstall. Putting Configure here instead
+ *     of as another inline section keeps the page body focused on
+ *     status + connection state + tool permissions, with all
+ *     "manage this connector" entry points in one consistent place.
+ *
+ *   - Tool permissions render inline as the page's primary content
+ *     for any ready connector — that's what users come here for once
+ *     setup is past.
+ *
+ * Reachable from `/settings/{personal,workspace}/connectors/:serverName`;
+ * scope comes from the route prefix.
  */
 export function ConnectorDetailPage({ scope }: { scope: "user" | "workspace" }) {
   const { serverName = "" } = useParams<{ serverName: string }>();
@@ -29,44 +46,46 @@ export function ConnectorDetailPage({ scope }: { scope: "user" | "workspace" }) 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [acting, setActing] = useState<string | null>(null);
+  const [configureModalOpen, setConfigureModalOpen] = useState(false);
+  // Two-step uninstall: first click arms the button (label changes
+  // to "Click again to confirm"), second click runs. Replaces
+  // window.confirm() — that gets suppressed by browsers after a
+  // few uses and silently makes destructive buttons no-op.
+  const [uninstallArmed, setUninstallArmed] = useState(false);
+
+  const role = useScopedRole();
+  // Workspace-scope edit gates ride on ws_admin. User-scope (personal
+  // connectors) is always editable by the owner — it's their account.
+  const canManage = scope === "user" ? true : roleAtLeast(role, "ws_admin");
 
   const refresh = useCallback(async () => {
     setError(null);
     try {
-      const res = await getInstalledConnectors({ scope });
-      const found = res.installed.find((i) => i.serverName === serverName) ?? null;
-      setInstalled(found);
+      // Targeted single-connector fetch — avoids building entries
+      // (and tools() round-trips) for every other installed bundle
+      // when we only render one. Note: scope is unused here; the
+      // server resolves scope from the serverName lookup, falling
+      // back to whichever scope the bundle is installed under.
+      const res = await getInstalledConnector(serverName);
+      setInstalled(res.installed);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setLoading(false);
     }
-  }, [serverName, scope]);
+  }, [serverName]);
 
   useEffect(() => {
     refresh();
   }, [refresh]);
 
-  const onReauth = async () => {
-    if (!installed) return;
-    setActing("reauth");
-    setError(null);
-    try {
-      const { authorizationUrl } = await initiateMcpOAuth(installed.serverName);
-      window.location.assign(authorizationUrl);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-      setActing(null);
-    }
-  };
-
   const onUninstall = async () => {
     if (!installed) return;
-    if (
-      !confirm(
-        `Uninstall "${installed.catalog?.name ?? installed.serverName}"? This removes credentials and tool permissions.`,
-      )
-    ) {
+    // First click arms; second click runs. Replaces window.confirm()
+    // (browsers suppress it after a few uses, silently no-op'ing
+    // destructive buttons).
+    if (!uninstallArmed) {
+      setUninstallArmed(true);
       return;
     }
     setActing("uninstall");
@@ -77,6 +96,7 @@ export function ConnectorDetailPage({ scope }: { scope: "user" | "workspace" }) 
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setActing(null);
+      setUninstallArmed(false);
     }
   };
 
@@ -95,18 +115,23 @@ export function ConnectorDetailPage({ scope }: { scope: "user" | "workspace" }) 
   }
 
   const cat = installed.catalog;
-  // Reconnect is OAuth-flow specific. Local bundles can be in dead /
-  // crashed state too, but they need a different recovery path
-  // (restart, not OAuth re-init). Hide the button for non-remote.
-  const reconnectable =
-    installed.type === "remote" &&
-    (installed.state === "reauth_required" ||
-      installed.state === "dead" ||
-      installed.state === "crashed");
+
+  // Header-level Configure affordance. Visible when:
+  //   - the user can manage this connector
+  //   - the bundle declares a user_config schema (anything to set)
+  //   - the status isn't `needs_setup` — when it is, the hero owns
+  //     the primary CTA and a duplicate header button would
+  //     double-count the prompt
+  const showHeaderConfigure =
+    canManage &&
+    !!installed.userConfig &&
+    Object.keys(installed.userConfig.schema).length > 0 &&
+    installed.status !== "needs_setup";
 
   return (
-    <div className="max-w-3xl mx-auto space-y-6">
-      {/* Action bar — back link on the left, docs + uninstall on the right */}
+    <div className="max-w-3xl mx-auto space-y-8">
+      {/* Action bar — back link on the left, secondary management
+          affordances on the right (Docs / Configure / Uninstall). */}
       <div className="flex items-center justify-between gap-3 flex-wrap">
         <Link to={backPath} className="text-xs text-muted-foreground hover:underline">
           ← All connectors
@@ -122,88 +147,64 @@ export function ConnectorDetailPage({ scope }: { scope: "user" | "workspace" }) 
               Docs ↗
             </a>
           )}
-          <button
-            type="button"
-            onClick={onUninstall}
-            disabled={acting !== null}
-            className="text-xs text-destructive hover:underline disabled:opacity-60"
-          >
-            {acting === "uninstall" ? "Uninstalling…" : "Uninstall"}
-          </button>
+          {showHeaderConfigure && (
+            <button
+              type="button"
+              onClick={() => setConfigureModalOpen(true)}
+              className="text-xs px-3 py-1.5 rounded border border-border bg-background hover:bg-muted"
+            >
+              Configure
+            </button>
+          )}
+          {canManage && (
+            <button
+              type="button"
+              onClick={onUninstall}
+              onBlur={() => setUninstallArmed(false)}
+              disabled={acting !== null}
+              className={`text-xs hover:underline disabled:opacity-60 ${
+                uninstallArmed
+                  ? "text-destructive font-semibold"
+                  : "text-destructive/80 hover:text-destructive"
+              }`}
+            >
+              {acting === "uninstall"
+                ? "Uninstalling…"
+                : uninstallArmed
+                  ? "Click again to confirm"
+                  : "Uninstall"}
+            </button>
+          )}
         </div>
       </div>
 
-      {/* Header — icon + name + metadata, no card chrome */}
-      <div className="flex items-start gap-4">
-        {cat?.iconUrl && (
-          <img
-            src={cat.iconUrl}
-            alt=""
-            className="h-12 w-12 rounded shrink-0"
-            onError={(e) => ((e.target as HTMLImageElement).style.visibility = "hidden")}
-          />
-        )}
-        <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2 flex-wrap">
-            <h1 className="text-xl font-semibold tracking-tight">
-              {cat?.name ?? installed.serverName}
-            </h1>
-            {installed.interactive && (
-              <span className="text-[10px] px-1.5 py-0.5 rounded bg-accent/40 text-accent-foreground font-medium">
-                Interactive
-              </span>
-            )}
-          </div>
-          {cat?.description && (
-            <p className="text-sm text-muted-foreground mt-1">{cat.description}</p>
-          )}
-          <dl className="text-xs text-muted-foreground mt-3 flex flex-wrap gap-x-5 gap-y-1">
-            <div>
-              <dt className="inline">Type: </dt>
-              <dd className="inline font-medium text-foreground">{installed.type}</dd>
-            </div>
-            <div>
-              <dt className="inline">Scope: </dt>
-              <dd className="inline font-medium text-foreground">{installed.scope}</dd>
-            </div>
-            <div>
-              <dt className="inline">State: </dt>
-              <dd className="inline font-medium text-foreground">{installed.state}</dd>
-            </div>
-            {installed.version && installed.version !== "remote" && (
-              <div>
-                <dt className="inline">Version: </dt>
-                <dd className="inline font-medium text-foreground font-mono">
-                  {installed.version}
-                </dd>
-              </div>
-            )}
-            {installed.identity?.email && (
-              <div>
-                <dt className="inline">Connected as: </dt>
-                <dd className="inline font-medium text-foreground">{installed.identity.email}</dd>
-              </div>
-            )}
-          </dl>
-          {reconnectable && (
-            <div className="mt-3">
-              <button
-                type="button"
-                onClick={onReauth}
-                disabled={acting !== null}
-                className="text-xs px-3 py-1.5 rounded bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-60"
-              >
-                {acting === "reauth" ? "Reconnecting…" : "Reconnect"}
-              </button>
-            </div>
-          )}
-        </div>
-      </div>
+      {/* Hero — title block plus a status row that absorbs the
+          primary CTA. Quiet when ready; anchored when there's
+          something to do. */}
+      <ConnectorStatusHero installed={installed} canManage={canManage} onChanged={refresh} />
 
       {error && <p className="text-xs text-destructive">{error}</p>}
 
-      {/* Tool permissions */}
-      <ToolPermissionsTable serverName={installed.serverName} scope={scope} />
+      {/* Settings surfaces. Each renders only when its content is
+          present. Bundle config is no longer a section — the
+          Configure button in the header above opens the same modal. */}
+      <div className="space-y-6">
+        <OAuthConnectionSection installed={installed} canManage={canManage} onChanged={refresh} />
+        <OperatorOAuthSection installed={installed} canManage={canManage} onChanged={refresh} />
+        <ToolPermissionsTable serverName={installed.serverName} scope={scope} />
+      </div>
+
+      {configureModalOpen && (
+        <BundleCredentialsModal
+          installed={installed}
+          open={configureModalOpen}
+          onClose={() => setConfigureModalOpen(false)}
+          onSaved={() => {
+            setConfigureModalOpen(false);
+            refresh();
+          }}
+        />
+      )}
     </div>
   );
 }

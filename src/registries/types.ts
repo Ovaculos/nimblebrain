@@ -88,18 +88,21 @@ export interface RemoteOAuthInstall {
 }
 
 /**
- * mpak bundle. v1 surfaces these as browseable but the install action
- * is stubbed — the real mpak fetch + bundle registration lands when
- * the mpak.dev API client is wired through.
+ * mpak bundle install. The package is fetched via mpak SDK and
+ * spawned as a stdio subprocess. CuratedRegistry emits these from
+ * the bundled stdio-catalog.yaml; future MpakRegistry implementations
+ * will emit them from mpak.dev's search results.
+ *
+ * TODO(mpak-registry): when the live mpak.dev fetch lands, this type
+ * needs `version` (selected release) and `mpakUrl` (download href)
+ * back. Both fields existed in an earlier draft and were trimmed
+ * because CuratedRegistry doesn't need them — but the discriminated
+ * union has to widen again before MpakRegistry can do useful work.
  */
 export interface MpakBundleInstall {
   kind: "mpak-bundle";
   /** Scoped package name, e.g., "@nimblebraininc/echo". */
   package: string;
-  /** Optional pinned version; omitted = latest. */
-  version?: string;
-  /** mpak.dev URL for the bundle's detail page. */
-  mpakUrl?: string;
 }
 
 /**
