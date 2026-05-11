@@ -118,8 +118,11 @@ export function AboutTab() {
         if (installResult.isError) {
           const msg =
             installResult.content
-              ?.filter((c: { type: string }) => c.type === "text")
-              .map((c: { text: string }) => c.text)
+              ?.filter(
+                (c): c is { type: "text"; text: string } =>
+                  c.type === "text" && typeof c.text === "string",
+              )
+              .map((c) => c.text)
               .join("") ?? "Install failed";
           setUploadError(msg);
           return;
@@ -200,7 +203,6 @@ export function AboutTab() {
             }
           />
         ) : null}
-
 
         {loading ? (
           <p className="text-sm text-muted-foreground">Loading...</p>

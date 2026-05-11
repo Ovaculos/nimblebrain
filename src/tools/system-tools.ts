@@ -968,27 +968,6 @@ async function installBundleInWorkspaceViaCtx(
  * predate `serverName`-on-ref persistence. Exported so the regression
  * is unit-testable independently of the full uninstall stack.
  */
-/**
- * True if a persisted workspace.json `BundleRef` entry matches the
- * `{name?, path?}` target shape used by the install/uninstall handlers.
- *
- * One predicate, two call sites — the install pre-check ("is this bundle
- * already registered in workspace.json?") and the uninstall filter ("which
- * entry should I drop?"). Keeping the dispatch in one place means the two
- * stay in lockstep; the previous filter only matched `{name}` entries and
- * silently left `{path}`-installed bundles in workspace.json forever.
- *
- * Exported so the unit test pins the contract.
- */
-export function bundleEntryMatchesTarget(
-  entry: { name?: string; path?: string },
-  target: { name?: string; path?: string },
-): boolean {
-  if (target.name && "name" in entry) return entry.name === target.name;
-  if (target.path && "path" in entry) return entry.path === target.path;
-  return false;
-}
-
 export function resolveBundleServerName(
   bundleName: string,
   ws: { bundles: Array<{ name?: string; serverName?: string }> } | null,
