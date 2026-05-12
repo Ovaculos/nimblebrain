@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import type { ToolCallDisplay } from "../src/hooks/useChat";
-import { describeBatch, describeCall, registerToolRenderer } from "../src/lib/tool-display";
+import { describeCall, registerToolRenderer } from "../src/lib/tool-display";
 import { clearRenderersForTest } from "../src/lib/tool-display/registry";
 import { dominantVerb, inferVerb, phraseFor } from "../src/lib/tool-display/verbs";
 
@@ -234,77 +234,6 @@ describe("describeCall — Tier 0 generic", () => {
       call({ name: "x_y", result: { content: [{ type: "image", data: "…" }], isError: false } }),
     );
     expect(d.resultText).toBeNull();
-  });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-describe("describeBatch", () => {
-  it("returns an empty batch for zero calls", () => {
-    const b = describeBatch([]);
-    expect(b.items).toEqual([]);
-    expect(b.verbPhrase).toBe("");
-    expect(b.totalMs).toBeNull();
-  });
-
-  it("uses the dominant verb across a mixed batch", () => {
-    const b = describeBatch([
-      call({ name: "get_source" }),
-      call({ name: "patch_source" }),
-      call({ name: "get_source" }),
-    ]);
-    expect(b.verbPhrase).toBe("Edited the source");
-    expect(b.tone).toBe("ok");
-  });
-
-  it("switches to error phrasing when any call failed", () => {
-    const b = describeBatch([
-      call({ name: "patch_source" }),
-      call({ name: "patch_source", status: "error", ok: false }),
-    ]);
-    expect(b.tone).toBe("error");
-    expect(b.verbPhrase).toBe("Couldn't edit the source");
-  });
-
-  it("reports running tone when any call is running, regardless of errors later", () => {
-    const b = describeBatch([
-      call({ name: "patch_source", status: "error", ok: false }),
-      call({ name: "get_source", status: "running" }),
-    ]);
-    expect(b.tone).toBe("running");
-  });
-
-  it("uses present-progressive verb phrasing while running", () => {
-    const b = describeBatch([call({ name: "research_topic", status: "running", ms: undefined })]);
-    expect(b.tone).toBe("running");
-    expect(b.verbPhrase).toBe("Researching the topic");
-  });
-
-  it("pairs the dominant verb with the object from the first call using that verb", () => {
-    const b = describeBatch([
-      call({ name: "get_doc" }),
-      call({ name: "patch_source" }),
-      call({ name: "patch_config" }),
-    ]);
-    // Dominant verb is Edited; first Edited call is patch_source → object "source"
-    expect(b.verbPhrase).toBe("Edited the source");
-  });
-
-  it("sums durations across calls", () => {
-    const b = describeBatch([
-      call({ name: "a_x", ms: 5 }),
-      call({ name: "b_y", ms: 15 }),
-    ]);
-    expect(b.totalMs).toBe(20);
-  });
-
-  it("treats missing durations as zero when others exist", () => {
-    const b = describeBatch([call({ name: "a_x", ms: undefined }), call({ name: "b_y", ms: 15 })]);
-    expect(b.totalMs).toBe(15);
-  });
-
-  it("returns null totalMs when no call has a duration", () => {
-    const b = describeBatch([call({ name: "a_x", ms: undefined })]);
-    expect(b.totalMs).toBeNull();
   });
 });
 

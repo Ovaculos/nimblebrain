@@ -1,8 +1,8 @@
 /**
  * Generic describer — Tier 0.
  *
- * Transforms raw `ToolCallDisplay` data into `ToolDescription` / `BatchDescription`
- * shapes that the UI consumes. Pure, side-effect free, deterministic.
+ * Transforms raw `ToolCallDisplay` data into a `ToolDescription` shape that
+ * the UI consumes. Pure, side-effect free, deterministic.
  *
  * This is the fallback that runs for every tool call that doesn't have a
  * custom `ToolRenderer` registered. Apps opt into richer rendering by
@@ -13,8 +13,8 @@
 import type { ToolCallDisplay, ToolResultForUI } from "../../hooks/useChat.ts";
 import { stripServerPrefix } from "../format.ts";
 import { findRenderer } from "./registry.ts";
-import type { BatchDescription, InputField, Tone, ToolDescription } from "./types.ts";
-import { dominantVerb, inferVerb, phraseFor } from "./verbs.ts";
+import type { InputField, Tone, ToolDescription } from "./types.ts";
+import { inferVerb } from "./verbs.ts";
 
 /** Max characters for an inline "short" value; longer values render as <pre>. */
 const SHORT_VALUE_MAX = 80;
@@ -51,15 +51,6 @@ export function describeCall(call: ToolCallDisplay): ToolDescription {
   const custom = findRenderer(call.name);
   if (custom) return custom.describe(call);
   return genericDescribe(call);
-}
-
-/** Describe a batch of calls from a single assistant turn. */
-export function describeBatch(calls: ReadonlyArray<ToolCallDisplay>): BatchDescription {
-  const items = calls.map(describeCall);
-  const tone = aggregateTone(items);
-  const verbPhrase = batchPhrase(items, tone);
-  const totalMs = sumDurations(items);
-  return { verbPhrase, tone, items, totalMs };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -99,44 +90,6 @@ function toneFromStatus(call: ToolCallDisplay): Tone {
   if (call.status === "error" || call.ok === false) return "error";
   if (call.result?.isError) return "error";
   return "ok";
-}
-
-/**
- * Aggregate per-call tones into a batch tone.
- *   any running → running  (the spinner wins — show live state)
- *   any error   → error    (honest failure signal)
- *   otherwise   → ok
- */
-function aggregateTone(items: ReadonlyArray<ToolDescription>): Tone {
-  if (items.some((it) => it.tone === "running")) return "running";
-  if (items.some((it) => it.tone === "error")) return "error";
-  return "ok";
-}
-
-/**
- * Pick the batch verb phrase. Use dominant verb across calls, pair with the
- * object from the first call that used that verb. On error tone, swap for
- * the "Couldn't X" phrasing.
- */
-function batchPhrase(items: ReadonlyArray<ToolDescription>, tone: Tone): string {
-  if (items.length === 0) return "";
-  const verbs = items.map((it) => it.verb);
-  const verb = dominantVerb(verbs);
-  const firstWithVerb = items.find((it) => it.verb === verb);
-  const object = firstWithVerb?.object ?? "";
-  return phraseFor(verb, object, tone);
-}
-
-function sumDurations(items: ReadonlyArray<ToolDescription>): number | null {
-  let hasAny = false;
-  let total = 0;
-  for (const it of items) {
-    if (typeof it.durationMs === "number") {
-      hasAny = true;
-      total += it.durationMs;
-    }
-  }
-  return hasAny ? total : null;
 }
 
 /**
