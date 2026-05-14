@@ -1,15 +1,12 @@
-import { IFRAME_BRIDGE_SCRIPT } from "../../../api/iframe-bridge-script.ts";
-import { BRIDGE_HELPER } from "./_bridge.ts";
-
-// The Synapse runtime + BRIDGE_HELPER already provides a `synapse` instance,
-// but this script needs the lightweight NBBridge helper too: the size-
-// notification path doesn't have a Synapse equivalent today, and we want
-// the validated outbound (host-origin targetOrigin) + validated inbound
-// (event.source + event.origin pinning) introduced for issue #99.
-export const HOME_BRIEFING_INLINE_SCRIPT =
-  IFRAME_BRIDGE_SCRIPT +
-  BRIDGE_HELPER +
-  `
+// The inline briefing widget subscribes via the Synapse SDK (`App.on`),
+// which maps the host's JSON-RPC `ui/notifications/tool-result` to the
+// short `"tool-result"` event name and delivers the
+// `{ content, structuredContent, raw }` payload. Listening directly for
+// `"synapse/tool-result"` (the prior shape) never fires — the host
+// doesn't emit that method. `autoResize: true` lets the SDK send
+// `ui/notifications/size-changed` itself; no raw postMessage needed.
+// See issue #220.
+export const HOME_BRIEFING_INLINE_SCRIPT = `
 const app = document.getElementById("app");
 
 // --- Markdown helpers ---
@@ -62,22 +59,18 @@ function renderInline(data) {
 
   html += '</div>';
   app.innerHTML = html;
-
-  // Report height for auto-sizing. NBBridge queues until handshake captures
-  // the host origin, then sends with the pinned origin as targetOrigin.
-  var height = document.body.scrollHeight;
-  window.NBBridge.send({ method: "ui/notifications/size-changed", params: { height: height } });
 }
 
-// Listen for tool result from host. NBBridge validates event.source and
-// event.origin before dispatching to this handler.
-window.NBBridge.on("synapse/tool-result", function(msg) {
-  var data = msg.params && msg.params.result;
-  if (data && typeof data === "object") {
-    renderInline(typeof data === "string" ? JSON.parse(data) : data);
-  }
-});
-
-// Show minimal loading state
+// Show minimal loading state immediately so the widget never looks blank.
 app.innerHTML = '<div class="inline-briefing"><div class="greeting" style="color:var(--muted,#71717a)">Loading briefing...</div></div>';
+
+Synapse.connect({ name: "nb-home-briefing-inline", version: "1.0.0", autoResize: true })
+  .then(function(synapseApp) {
+    synapseApp.on("tool-result", function(data) {
+      var payload = data && data.structuredContent;
+      if (payload && typeof payload === "object") {
+        renderInline(payload);
+      }
+    });
+  });
 `;
