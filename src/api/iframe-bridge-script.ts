@@ -22,7 +22,13 @@
  *   send(message)         — postMessage to parent with pinned origin
  *                           (queued until handshake captures origin)
  *   on(method, handler)   — subscribe to validated inbound notifications
+ *   off(method, handler)  — unsubscribe a previously registered handler
  *   getHostOrigin()       — current pinned origin (or null pre-handshake)
+ *
+ * Suspicious rejections (claimed/actual origin mismatch on handshake,
+ * post-handshake origin drift, postMessage failure) emit `console.warn`
+ * so the failure mode is visible during development. Routine drops
+ * (non-parent source, handlers that throw) stay silent.
  *
  * Served verbatim at `GET /iframe-bridge.js`. Also inlined into the
  * platform's own core-resource scripts so they don't have to fetch over
@@ -34,6 +40,15 @@ export const IFRAME_BRIDGE_SCRIPT = `(function () {
   var hostOrigin = null;
   var pendingSend = [];
   var handlers = Object.create(null);
+
+  function warn(msg, detail) {
+    try {
+      if (typeof console !== "undefined" && console.warn) {
+        if (detail === undefined) console.warn("[NBBridge] " + msg);
+        else console.warn("[NBBridge] " + msg, detail);
+      }
+    } catch (_) {}
+  }
 
   function extractClaimedOrigin(data) {
     if (!data || typeof data !== "object") return null;
@@ -50,7 +65,8 @@ export const IFRAME_BRIDGE_SCRIPT = `(function () {
     var queue = pendingSend;
     pendingSend = [];
     for (var i = 0; i < queue.length; i++) {
-      try { window.parent.postMessage(queue[i], hostOrigin); } catch (e) {}
+      try { window.parent.postMessage(queue[i], hostOrigin); }
+      catch (e) { warn("postMessage failed during flush", e); }
     }
   }
 
@@ -67,10 +83,21 @@ export const IFRAME_BRIDGE_SCRIPT = `(function () {
     if (event.source !== window.parent) return;
     if (!hostOrigin) {
       var claimed = extractClaimedOrigin(event.data);
-      if (!claimed || claimed !== event.origin) return;
+      if (!claimed) return;
+      if (claimed !== event.origin) {
+        warn(
+          "handshake rejected: claimed origin " + claimed +
+          " does not match event.origin " + event.origin
+        );
+        return;
+      }
       hostOrigin = claimed;
       flushPending();
     } else if (event.origin !== hostOrigin) {
+      warn(
+        "dropped message from unexpected origin " + event.origin +
+        " (pinned host is " + hostOrigin + ")"
+      );
       return;
     }
     dispatch(event.data);
@@ -81,7 +108,8 @@ export const IFRAME_BRIDGE_SCRIPT = `(function () {
   window.NBBridge = {
     send: function (message) {
       if (hostOrigin) {
-        try { window.parent.postMessage(message, hostOrigin); } catch (e) {}
+        try { window.parent.postMessage(message, hostOrigin); }
+        catch (e) { warn("postMessage failed", e); }
       } else {
         pendingSend.push(message);
       }
@@ -90,6 +118,14 @@ export const IFRAME_BRIDGE_SCRIPT = `(function () {
       if (typeof method !== "string" || typeof handler !== "function") return;
       if (!handlers[method]) handlers[method] = [];
       handlers[method].push(handler);
+    },
+    off: function (method, handler) {
+      if (typeof method !== "string" || typeof handler !== "function") return;
+      var list = handlers[method];
+      if (!list) return;
+      var idx = list.indexOf(handler);
+      if (idx !== -1) list.splice(idx, 1);
+      if (list.length === 0) delete handlers[method];
     },
     getHostOrigin: function () { return hostOrigin; },
   };

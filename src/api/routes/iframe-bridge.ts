@@ -21,6 +21,9 @@ export function iframeBridgeRoutes(_ctx: AppContext) {
     return c.body(IFRAME_BRIDGE_SCRIPT, 200, {
       "Content-Type": "application/javascript; charset=utf-8",
       "Cache-Control": "public, max-age=300",
+      // Block MIME-sniffing — endpoint is unauthenticated and must only
+      // ever be interpreted as JavaScript, never as HTML/SVG.
+      "X-Content-Type-Options": "nosniff",
     });
   });
 

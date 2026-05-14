@@ -27,6 +27,7 @@ describe("GET /iframe-bridge.js", () => {
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toBe("application/javascript; charset=utf-8");
     expect(res.headers.get("cache-control")).toContain("max-age=");
+    expect(res.headers.get("x-content-type-options")).toBe("nosniff");
     const body = await res.text();
     expect(body).toContain("window.NBBridge");
     expect(body).toContain("getHostOrigin");
@@ -51,6 +52,7 @@ interface FakeWindow {
   NBBridge?: {
     send(message: unknown): void;
     on(method: string, handler: (msg: { method: string; params?: unknown }) => void): void;
+    off(method: string, handler: (msg: { method: string; params?: unknown }) => void): void;
     getHostOrigin(): string | null;
   };
 }
@@ -212,5 +214,125 @@ describe("NBBridge helper behavior", () => {
 
     expect(a).toHaveLength(2);
     expect(b).toHaveLength(1);
+  });
+
+  it("off() removes a previously registered handler", () => {
+    const { window: w, deliver } = loadHelper();
+    const calls: number[] = [];
+    const handler = () => calls.push(1);
+
+    w.NBBridge?.on("ping", handler);
+
+    deliver(
+      {
+        jsonrpc: "2.0",
+        method: "ui/initialize",
+        params: { apiBase: "http://h.example.com" },
+      },
+      "http://h.example.com",
+    );
+
+    deliver({ method: "ping" }, "http://h.example.com");
+    expect(calls).toHaveLength(1);
+
+    w.NBBridge?.off("ping", handler);
+    deliver({ method: "ping" }, "http://h.example.com");
+    expect(calls).toHaveLength(1);
+  });
+
+  it("off() leaves unrelated handlers intact", () => {
+    const { window: w, deliver } = loadHelper();
+    const a: number[] = [];
+    const b: number[] = [];
+    const handlerA = () => a.push(1);
+    const handlerB = () => b.push(1);
+
+    w.NBBridge?.on("evt", handlerA);
+    w.NBBridge?.on("evt", handlerB);
+
+    deliver(
+      {
+        jsonrpc: "2.0",
+        method: "ui/initialize",
+        params: { apiBase: "http://h.example.com" },
+      },
+      "http://h.example.com",
+    );
+
+    w.NBBridge?.off("evt", handlerA);
+    deliver({ method: "evt" }, "http://h.example.com");
+
+    expect(a).toHaveLength(0);
+    expect(b).toHaveLength(1);
+  });
+});
+
+describe("NBBridge helper diagnostics", () => {
+  function captureWarns(fn: () => void): string[] {
+    const warns: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (...args: unknown[]) => {
+      warns.push(args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" "));
+    };
+    try {
+      fn();
+    } finally {
+      console.warn = originalWarn;
+    }
+    return warns;
+  }
+
+  it("warns when handshake claims an origin different from event.origin", () => {
+    const warns = captureWarns(() => {
+      const { deliver } = loadHelper();
+      deliver(
+        {
+          jsonrpc: "2.0",
+          method: "ui/initialize",
+          params: { apiBase: "http://platform.example.com" },
+        },
+        "https://evil.example.com",
+      );
+    });
+
+    expect(warns.length).toBeGreaterThan(0);
+    expect(warns[0]).toContain("handshake rejected");
+    expect(warns[0]).toContain("http://platform.example.com");
+    expect(warns[0]).toContain("https://evil.example.com");
+  });
+
+  it("warns when a post-handshake message arrives from a different origin", () => {
+    const warns = captureWarns(() => {
+      const { deliver } = loadHelper();
+      deliver(
+        {
+          jsonrpc: "2.0",
+          method: "ui/initialize",
+          params: { apiBase: "http://platform.example.com" },
+        },
+        "http://platform.example.com",
+      );
+      deliver({ method: "synapse/tool-result" }, "https://evil.example.com");
+    });
+
+    expect(warns.some((w) => w.includes("unexpected origin"))).toBe(true);
+  });
+
+  it("stays silent on routine non-parent-source messages", () => {
+    const warns = captureWarns(() => {
+      const { deliver } = loadHelper();
+      const otherWindow = { unrelated: true };
+      deliver(
+        {
+          jsonrpc: "2.0",
+          method: "ui/initialize",
+          params: { apiBase: "http://h.example.com" },
+        },
+        "http://h.example.com",
+        otherWindow,
+      );
+    });
+
+    expect(warns).toHaveLength(0);
   });
 });
