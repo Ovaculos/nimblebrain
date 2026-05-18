@@ -4,6 +4,14 @@
  */
 import type { Static, TSchema } from "@sinclair/typebox";
 export declare const PlatformToolCatalog: {
+    readonly nb: {
+        readonly manage_tools: {
+            readonly input: import("@sinclair/typebox").TObject<{
+                add: import("@sinclair/typebox").TOptional<import("@sinclair/typebox").TArray<import("@sinclair/typebox").TString>>;
+                remove: import("@sinclair/typebox").TOptional<import("@sinclair/typebox").TArray<import("@sinclair/typebox").TString>>;
+            }>;
+        };
+    };
     readonly skills: {
         readonly list: {
             readonly input: import("@sinclair/typebox").TObject<{

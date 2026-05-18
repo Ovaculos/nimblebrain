@@ -32,6 +32,7 @@ import type {
   EngineHooks,
   EventSink,
   SkillsLoadedPayload,
+  ToolPromotionResult,
   ToolSchema,
 } from "../engine/types.ts";
 import { rehydrateUserResources } from "../files/rehydrate.ts";
@@ -89,6 +90,7 @@ const DEFAULT_MODEL = "claude-sonnet-4-6";
 import { DEFAULT_MAX_INPUT_TOKENS, DEFAULT_MAX_ITERATIONS } from "../limits.ts";
 import { resolveMaxOutputTokens } from "./resolve-max-output-tokens.ts";
 import { resolveThinking } from "./resolve-thinking.ts";
+import { isToolEligibleForPromotion } from "./tool-eligibility.ts";
 
 const DEFAULT_MAX_HISTORY_MESSAGES = 40;
 
@@ -384,6 +386,13 @@ export class Runtime {
       configMaxOutputTokens: config.maxOutputTokens,
       configThinking: config.thinking,
       configThinkingBudgetTokens: config.thinkingBudgetTokens,
+      // Per-engine isolation for tool promotion: child engines get their
+      // own controls installed in reqCtx (with save/restore) instead of
+      // inheriting the parent's via AsyncLocalStorage.
+      get toolPromotion() {
+        if (!rtHolder.rt) return undefined;
+        return rtHolder.rt.buildToolPromotionFactory();
+      },
     };
 
     // System tools (search, manage_app, bundle_status, delegate). Skill
@@ -457,6 +466,25 @@ export class Runtime {
       // live-update pipeline as boot-time bundle startup.
       eventSink: events,
     };
+    const noActiveToolPromotionRun = (toolName: string): ToolPromotionResult => ({
+      ok: false,
+      toolName,
+      changed: false,
+      reason: "no_active_run",
+      message: "Tool promotion tools can only be called during an active agent run.",
+    });
+    const toolPromotionCtx = {
+      addTool: (toolName: string) =>
+        getRequestContext()?.toolPromotion?.addTool(toolName) ?? noActiveToolPromotionRun(toolName),
+      removeTool: (toolName: string) =>
+        getRequestContext()?.toolPromotion?.removeTool(toolName) ??
+        noActiveToolPromotionRun(toolName),
+    };
+    const isToolEligibleForCurrentRequest = (tool: ToolSchema): boolean => {
+      const ctx = getRequestContext();
+      return isToolEligibleForPromotion(tool, ctx?.identity?.orgRole, features);
+    };
+    const toolEligibilityCtx = { isToolEligible: isToolEligibleForCurrentRequest };
 
     // Create Runtime with empty workspace registries first — needed by system tools
     const rt = new Runtime(
@@ -508,6 +536,8 @@ export class Runtime {
       manageMembersCtx,
       manageConversationCtx,
       manageBundleCtx,
+      toolPromotionCtx,
+      toolEligibilityCtx,
     );
     rt._systemSource = systemTools;
 
@@ -973,6 +1003,7 @@ export class Runtime {
       workspaceModelOverride: workspace?.models ?? null,
       conversationId: conversation.id,
     };
+    engineConfig.toolPromotion = this.buildToolPromotionFactory();
 
     // Emit chat.start so the client knows the conversation ID immediately
     // and conversation list UIs can refresh
@@ -1138,6 +1169,47 @@ export class Runtime {
   /** Get the resolved feature flags (needed by server.ts for HTTP gate in task 007). */
   getFeatures(): ResolvedFeatures {
     return this._features;
+  }
+
+  /**
+   * Build the engine-config `toolPromotion` factory for a single agent run.
+   * Both the top-level Runtime.chat() engine.run() AND any nested engine
+   * (e.g. delegate sub-agents) call this so each engine gets its OWN
+   * promotion controls installed in the request context for the lifetime
+   * of its run. The save/restore in `registerControls` lets nested engines
+   * stack: parent installs → child installs (saves parent) → child
+   * unregister restores parent → parent unregister deletes.
+   *
+   * Without this isolation, AsyncLocalStorage propagates the parent's
+   * `reqCtx.toolPromotion` into the child's frame; a sub-agent calling
+   * nb__manage_tools would silently mutate the parent's directTools and
+   * its own changes would never reach its own modelTools. See the
+   * regression test in test/unit/engine.test.ts.
+   */
+  buildToolPromotionFactory(): NonNullable<EngineConfig["toolPromotion"]> {
+    const features = this._features;
+    return {
+      isToolEligible: (tool) =>
+        isToolEligibleForPromotion(tool, getRequestContext()?.identity?.orgRole, features),
+      registerControls: (controls) => {
+        const ctx = getRequestContext();
+        if (!ctx) {
+          // No request context = no place to install controls. Caller's
+          // unregister becomes a no-op; their nb__manage_tools handler
+          // hits the "no_active_run" path. Acceptable degradation.
+          return () => {};
+        }
+        const prev = ctx.toolPromotion;
+        ctx.toolPromotion = controls;
+        return () => {
+          if (prev === undefined) {
+            delete ctx.toolPromotion;
+          } else {
+            ctx.toolPromotion = prev;
+          }
+        };
+      },
+    };
   }
 
   /** Scoped internal token for protected default bundles. Rotated on every restart. */
