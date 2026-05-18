@@ -466,7 +466,15 @@ export class AgentEngine {
     const unregisterToolControls = config.toolPromotion?.registerControls(toolControls);
     try {
       while (iteration < maxIter) {
-        const modelTools: LanguageModelV3FunctionTool[] = directTools.map((t) => ({
+        // Filter out any tool the supervisor has tripped this run. Removing
+        // the tool from the model's toolset is more reliable than telling
+        // the model "do not call this tool" via prose — the model literally
+        // can't call a tool that isn't in its list. Other tools remain
+        // available so the run can recover.
+        const trippedSet = new Set(supervisor.snapshot().trippedTools);
+        const usableDirectTools =
+          trippedSet.size === 0 ? directTools : directTools.filter((t) => !trippedSet.has(t.name));
+        const modelTools: LanguageModelV3FunctionTool[] = usableDirectTools.map((t) => ({
           type: "function" as const,
           name: t.name,
           description: t.description,
@@ -474,7 +482,7 @@ export class AgentEngine {
         }));
 
         const toolSchemaMap = new Map<string, ToolSchema>();
-        for (const t of directTools) {
+        for (const t of usableDirectTools) {
           toolSchemaMap.set(t.name, t);
         }
 
@@ -495,18 +503,6 @@ export class AgentEngine {
             "\n\n[IMPORTANT: This is your final step. Do NOT call any more tools. " +
             "Summarize what you have accomplished so far and clearly list what " +
             "remains unfinished so the user can continue in a follow-up message.]";
-        }
-
-        // One-shot nudge after the supervisor tripped on the previous iteration.
-        // Pairs with the synth-stop replacement so the directive is unambiguous:
-        // the tool result tells the model what to say, the system-prompt nudge
-        // forecloses further tool calls.
-        if (supervisor.needsPromptNudge()) {
-          callPrompt +=
-            "\n\n[IMPORTANT: A tool was detected to be in a loop and has been disabled " +
-            "for the remainder of this run. Do NOT call any more tools. Produce a final " +
-            "response now per the instructions in the last tool result.]";
-          supervisor.consumeNudge();
         }
 
         const callProviderOptions = buildThinkingProviderOptions(config.model, config.thinking);
@@ -724,9 +720,10 @@ export class AgentEngine {
 
             // Supervisor sees the post-hook, post-A.3-normalization result.
             // On a trip, the replacement directive flows downstream in place
-            // of the original — the model sees the directive in its tool
-            // message and the engine appends a system-prompt nudge on the
-            // next iteration via `needsPromptNudge()`.
+            // of the original tool result. The tripped tool is filtered out
+            // of `modelTools` on subsequent iterations (see the top of the
+            // run loop), so the model can't call it again regardless of
+            // what the directive says.
             const verdict = supervisor.observe(gatedCall, hookedResult);
             const finalResult = verdict.type === "synth" ? verdict.replacement : hookedResult;
 
