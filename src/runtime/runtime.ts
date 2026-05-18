@@ -52,6 +52,7 @@ import type { Layer3SkillEntry, PromptAppInfo } from "../prompt/compose.ts";
 import { composeSystemPrompt } from "../prompt/compose.ts";
 import { ConnectorDirectory } from "../registries/directory.ts";
 import { RegistryStore } from "../registries/registry-store.ts";
+import { synthesizeBundleSkill } from "../skills/bundle-skills.ts";
 import {
   loadBuiltinSkills,
   loadCoreSkills,
@@ -63,12 +64,13 @@ import {
 import { SkillMatcher } from "../skills/matcher.ts";
 import { selectLayer3Skills } from "../skills/select.ts";
 import { approxTokens } from "../skills/tokens.ts";
+import { truncateMarkdownToBudget } from "../skills/truncate.ts";
 import type { Skill } from "../skills/types.ts";
 import { TelemetryManager } from "../telemetry/manager.ts";
 import { PostHogEventSink } from "../telemetry/posthog-sink.ts";
 import type { DelegateContext } from "../tools/delegate.ts";
 import { McpSource } from "../tools/mcp-source.ts";
-import type { ToolRegistry } from "../tools/registry.ts";
+import { SharedSourceRef, type ToolRegistry } from "../tools/registry.ts";
 import { createSystemTools } from "../tools/system-tools.ts";
 import type { ResourceData } from "../tools/types.ts";
 import { UserConnectorStore } from "../users/user-connector-store.ts";
@@ -212,7 +214,12 @@ export class Runtime {
   private _manageConversationCtx:
     | import("../tools/conversation-tools.ts").ManageConversationContext
     | null = null;
-  private skillResourceCache = new Map<string, { content: string; fetchedAt: number }>();
+  /**
+   * Cache for `skill://<bundle>/usage` resource fetches. A `null` body is a
+   * sentinel meaning "this bundle does not publish the resource" — without it,
+   * `loadBundleSkills` would re-probe every non-skill bundle on every chat.
+   */
+  private skillResourceCache = new Map<string, { content: string | null; fetchedAt: number }>();
   private static readonly SKILL_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
   /**
    * Conversation IDs with an in-flight chat() call. Prevents concurrent runs on
@@ -849,12 +856,20 @@ export class Runtime {
     // Layer 3 selection — pick skills with `loading_strategy: always` and
     // `tool_affined` strategies based on the active tool set. The merged pool
     // includes platform / workspace / user tier skills (user > workspace >
-    // platform on name collisions).
+    // platform on name collisions). Bundle-exposed `skill://<name>/usage`
+    // resources are synthesized into the pool as `tool_affined` skills so a
+    // workspace-level chat picks them up whenever the bundle's tools are
+    // surfaced — no `appContext` scoping required (the prior path only fired
+    // under `appContext`, missing cross-app workflows).
     const userId = reqIdentity?.id ?? null;
     const layer3Pool = this.loadConversationSkills(wsId, userId);
+    const bundleSkills = await this.loadBundleSkills(wsId, {
+      appContextServerName: request.appContext?.serverName,
+    });
+    const mergedLayer3Pool: Skill[] = [...layer3Pool, ...bundleSkills];
     const activeToolNames = tools.map((t) => t.name);
     const selectedLayer3 = selectLayer3Skills({
-      skills: layer3Pool,
+      skills: mergedLayer3Pool,
       activeTools: activeToolNames,
     });
     const layer3Entries: Layer3SkillEntry[] = selectedLayer3.map((s) => ({
@@ -1221,7 +1236,18 @@ export class Runtime {
     return this._internalToken;
   }
 
-  /** Fetch the skill:// usage resource for an app's MCP server, with caching. */
+  /**
+   * Fetch the `skill://<serverName>/usage` resource for a bundle, with caching.
+   *
+   * Negative results (resource absent, source not MCP, transport error) are
+   * cached as a `null` sentinel — the common case is "this bundle has no skill
+   * resource," and re-issuing the read on every chat over a stable bundle set
+   * would N×-multiply the request-path latency.
+   *
+   * `SharedSourceRef`-wrapped sources are unwrapped before the `McpSource`
+   * check; protected default bundles arrive wrapped and would otherwise be
+   * silently invisible to this path.
+   */
   private async getAppSkillResource(serverName: string): Promise<string | null> {
     const cached = this.skillResourceCache.get(serverName);
     if (cached && Date.now() - cached.fetchedAt < Runtime.SKILL_CACHE_TTL) {
@@ -1234,25 +1260,28 @@ export class Runtime {
       source = reg.getSources().find((s) => s.name === serverName);
       if (source) break;
     }
-    if (!(source instanceof McpSource)) return null;
+    const unwrapped = source instanceof SharedSourceRef ? source.unwrap() : source;
+    if (!(unwrapped instanceof McpSource)) {
+      this.skillResourceCache.set(serverName, { content: null, fetchedAt: Date.now() });
+      return null;
+    }
 
+    let body: string | null = null;
     try {
-      const resource = await source.readResource(`skill://${serverName}/usage`);
+      const resource = await unwrapped.readResource(`skill://${serverName}/usage`);
       const content = resource?.text ?? null;
       if (content) {
-        // Token budget: cap at ~3000 tokens (~12000 chars)
-        const truncated =
-          content.length > 12000 ? `${content.slice(0, 12000)}\n\n[truncated]` : content;
-        this.skillResourceCache.set(serverName, {
-          content: truncated,
-          fetchedAt: Date.now(),
-        });
-        return truncated;
+        // Token budget: cap at ~3000 tokens (~12000 chars). Heading-aware
+        // so we don't slice mid-sentence (production case: a "rules" appendix
+        // at the end of a SKILL.md was lost mid-rule, breaking the model's
+        // tool-selection logic).
+        body = truncateMarkdownToBudget(content, 12000).body;
       }
     } catch {
-      // Resource doesn't exist or read failed — skip silently
+      // Resource doesn't exist or read failed — fall through to negative cache.
     }
-    return null;
+    this.skillResourceCache.set(serverName, { content: body, fetchedAt: Date.now() });
+    return body;
   }
 
   /** Check if an MCP source exposes a specific resource URI. */
@@ -1263,6 +1292,63 @@ export class Runtime {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * Probe every MCP source in `wsId`'s registry for a `skill://<name>/usage`
+   * resource and synthesize a Layer 3 `Skill` for any that responds. Each
+   * synthesized skill is `tool_affined` to `<name>__*`, so it loads via the
+   * standard `selectLayer3Skills` path whenever the bundle's tools are in
+   * the active toolset — no `appContext` required.
+   *
+   * Use case: a workspace-level chat where the model needs the bundle's
+   * workflow guidance but isn't "entered" into the app. Without this, the
+   * skill lived only on the `appContext`-scoped `<app-guide>` path and was
+   * invisible to cross-bundle chats.
+   *
+   * Resource fetches reuse `getAppSkillResource`'s 5-minute cache, so this
+   * stays cheap on warm requests. Per-source errors are swallowed (resource
+   * not found is the normal not-published case).
+   */
+  private async loadBundleSkills(
+    wsId: string,
+    options: { appContextServerName?: string } = {},
+  ): Promise<Skill[]> {
+    const registry = this._workspaceRegistries.get(wsId);
+    if (!registry) return [];
+
+    // Candidate sources: MCP-backed (unwrapping `SharedSourceRef` so protected
+    // default bundles are visible), and not the one already injected via
+    // `<app-guide>` in `appContext` chats — otherwise the same body lands
+    // twice in the prompt under two different framings.
+    //
+    // No trust-score gate: if a bundle is active its tools are callable, so
+    // suppressing the workflow guidance that teaches the model how to use them
+    // safely would make the situation worse, not better. Trust is enforced at
+    // install time. See `formatFocusedAppSection` for the matching policy on
+    // the `<app-guide>` path.
+    const candidates: string[] = [];
+    for (const source of registry.getSources()) {
+      if (source.name === options.appContextServerName) continue;
+      const inner = source instanceof SharedSourceRef ? source.unwrap() : source;
+      if (!(inner instanceof McpSource)) continue;
+      candidates.push(source.name);
+    }
+
+    // Parallel fetch: serial probing N-times-multiplied the chat hot-path
+    // latency on workspaces with many non-skill bundles. `getAppSkillResource`
+    // caches both positive and negative results so steady-state cost is zero.
+    const synthesized = await Promise.all(
+      candidates.map(async (name) => {
+        try {
+          const body = await this.getAppSkillResource(name);
+          return body ? synthesizeBundleSkill({ serverName: name, body }) : null;
+        } catch {
+          return null;
+        }
+      }),
+    );
+    return synthesized.filter((s): s is Skill => s !== null);
   }
 
   /**
