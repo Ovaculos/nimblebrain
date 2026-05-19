@@ -3,7 +3,6 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { log } from "../cli/log.ts";
 import { cleanupComposioBundle } from "../composio/sdk.ts";
-import { clearAllWorkspaceCredentials } from "../config/workspace-credentials.ts";
 import type { EventSink } from "../engine/types.ts";
 import type { PlacementRegistry } from "../runtime/placement-registry.ts";
 import { FileCredentialStore } from "../tools/credential-store.ts";
@@ -14,6 +13,7 @@ import {
   validateAdditionalAuthorizationParams,
   WorkspaceOAuthProvider,
 } from "../tools/workspace-oauth-provider.ts";
+import { WorkspaceContext } from "../workspace/context.ts";
 import { createAutomation, deleteAutomation } from "./automations/src/domain.ts";
 import { connectorSlug, hasPersistedComposioConnection } from "./composio-connection.ts";
 import {
@@ -136,16 +136,19 @@ export class BundleLifecycleManager {
 
     // Workspace-scoped data dir keeps two workspaces installing the same
     // bundle from stomping on each other's entity data. Matches the
-    // seedInstance layout used at platform boot.
+    // seedInstance layout used at platform boot. Routed through
+    // WorkspaceContext so the `workspaces/{wsId}/data/{slug}` layout has
+    // one definition site (see src/workspace/context.ts).
     const nbWorkDir = process.env.NB_WORK_DIR ?? join(homedir(), ".nimblebrain");
-    const bundleDataDir = join(nbWorkDir, "workspaces", wsId, "data", deriveBundleDataDir(name));
+    const wsContext = new WorkspaceContext({ wsId, workDir: nbWorkDir });
+    const bundleDataDir = wsContext.getDataPath("data", deriveBundleDataDir(name));
 
     const { sourceName, manifest } = await startBundleSource(
       { name, env },
       registry,
       this.eventSink,
       this.configPath ? dirname(this.configPath) : undefined,
-      { dataDir: bundleDataDir, wsId, workDir: nbWorkDir },
+      { dataDir: bundleDataDir, workspaceContext: wsContext },
     );
     if (!manifest) {
       // Named bundles always have a manifest — startBundleSource reads it
@@ -438,7 +441,9 @@ export class BundleLifecycleManager {
     if (instance) {
       const workDir = process.env.NB_WORK_DIR ?? join(homedir(), ".nimblebrain");
       try {
-        await clearAllWorkspaceCredentials(instance.wsId, instance.bundleName, workDir);
+        await new WorkspaceContext({ wsId: instance.wsId, workDir })
+          .getCredentialStore()
+          .clearAll(instance.bundleName);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         process.stderr.write(
@@ -452,14 +457,10 @@ export class BundleLifecycleManager {
       // shouldn't survive an uninstall. Worst case the dir is already
       // gone; rmSync with `force` is a no-op then.
       try {
-        const oauthDir = join(
+        const oauthDir = new WorkspaceContext({
+          wsId: instance.wsId,
           workDir,
-          "workspaces",
-          instance.wsId,
-          "credentials",
-          "mcp-oauth",
-          serverName,
-        );
+        }).getDataPath("credentials", "mcp-oauth", serverName);
         rmSync(oauthDir, { recursive: true, force: true });
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -496,14 +497,10 @@ export class BundleLifecycleManager {
           );
         }
         try {
-          const composioDir = join(
+          const composioDir = new WorkspaceContext({
+            wsId: instance.wsId,
             workDir,
-            "workspaces",
-            instance.wsId,
-            "credentials",
-            "composio",
-            connectorSlug(composioRef.connectorId),
-          );
+          }).getDataPath("credentials", "composio", connectorSlug(composioRef.connectorId));
           rmSync(composioDir, { recursive: true, force: true });
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -807,6 +804,12 @@ export class BundleLifecycleManager {
       owner: isWorkspaceScope ? { type: "workspace", wsId } : { type: "user", userId: principalId },
       serverName,
       workDir: opts.workDir,
+      // Workspace-scoped tokens route the credential directory through
+      // the typed handle; user-scoped tokens stay on the legacy
+      // workDir-derivation path (no workspace owns them).
+      ...(isWorkspaceScope
+        ? { workspaceContext: new WorkspaceContext({ wsId, workDir: opts.workDir }) }
+        : {}),
       callbackUrl: opts.callbackUrl,
       allowInsecureRemotes: opts.allowInsecureRemotes === true,
       onInteractiveAuthRequired: (url) => {
@@ -974,6 +977,9 @@ export class BundleLifecycleManager {
       owner: isWorkspaceScope ? { type: "workspace", wsId } : { type: "user", userId: principalId },
       serverName,
       workDir: opts.workDir,
+      ...(isWorkspaceScope
+        ? { workspaceContext: new WorkspaceContext({ wsId, workDir: opts.workDir }) }
+        : {}),
       callbackUrl: "http://_/", // unused for revocation path
       allowInsecureRemotes: opts.allowInsecureRemotes === true,
     });
