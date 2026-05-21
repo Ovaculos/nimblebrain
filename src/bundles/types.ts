@@ -274,7 +274,7 @@ export interface BundleManifest {
 
 /** Host manifest metadata at _meta["ai.nimblebrain/host"]. */
 export interface HostManifestMeta {
-  host_version: "1.0";
+  host_version: "1.0" | "1.1";
   name?: string;
   icon?: string;
   category?: string;
@@ -287,6 +287,31 @@ export interface HostManifestMeta {
     resourceUri: string;
   };
   briefing?: BriefingBlock;
+  /**
+   * NimbleBrain host capabilities this bundle requires or prefers. Keys are
+   * vendor-namespaced extension keys (e.g. `"ai.nimblebrain/host-resources"`)
+   * matching the platform's `ClientCapabilities.extensions` advertisement.
+   * Each value declares the bundle's requirements for that capability.
+   *
+   * Entries with `required: true` cause install to fail if the platform
+   * does not advertise the capability. Entries with `required: false` (or
+   * omitted) are prefers-but-adapts — bundles use the SDK's availability
+   * check at runtime and fall back gracefully (e.g. structured tool error
+   * teaching the agent to retry with inline content).
+   *
+   * Presence of this field requires `host_version: "1.1"` (enforced by
+   * the JSON Schema's `if/then`).
+   */
+  host_capabilities?: Record<string, HostCapabilityRequirement>;
+}
+
+/** Bundle's requirement against one NimbleBrain host capability. */
+export interface HostCapabilityRequirement {
+  /**
+   * When true, the platform must advertise this capability in
+   * ClientCapabilities.extensions or install is refused. Default: false.
+   */
+  required?: boolean;
 }
 
 /** Briefing declaration — how this app contributes to the daily briefing. */

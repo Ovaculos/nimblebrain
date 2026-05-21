@@ -7,6 +7,7 @@ import {
   type UserConfigFieldDef,
 } from "../config/workspace-credentials.ts";
 import type { EventSink } from "../engine/types.ts";
+import { assertHostCapabilitiesAvailable } from "../host-resources/index.ts";
 import { FileCredentialStore } from "../tools/credential-store.ts";
 import { McpSource } from "../tools/mcp-source.ts";
 import type { ToolRegistry } from "../tools/registry.ts";
@@ -491,9 +492,18 @@ export async function startBundleSource(
       // capability declarations, so http-proxy (and any future declaration)
       // gets silently skipped at spawn. Surface it loudly instead of letting
       // operators chase phantom UI bugs.
+      //
+      // The host-capability gate is also degraded by this path: with
+      // `manifest === null`, `assertHostCapabilitiesAvailable` below
+      // is skipped, so a `host_capabilities[k] = { required: true }`
+      // declaration that would normally refuse install is silently bypassed.
+      // Phase 1 is a no-op (no bundle declares required:true yet); fail-closed
+      // semantics for this path are a Phase 2 follow-up alongside the
+      // first bundle that depends on the gate.
       log.warn(
         `[bundles] manifest cache miss for ${ref.name} — capability declarations ` +
-          "(http-proxy, etc.) will be skipped at spawn. Reinstall the bundle to repopulate.",
+          "(http-proxy, host_capabilities, etc.) will be skipped at spawn, including " +
+          "the install-time host-resources gate. Reinstall the bundle to repopulate.",
       );
     }
 
@@ -565,6 +575,18 @@ export async function startBundleSource(
     source = result.source;
     meta = result.meta;
     manifest = result.manifest;
+  }
+
+  // Refuse to spawn a bundle whose `host_capabilities` declares required
+  // capabilities the platform doesn't advertise. Single chokepoint for
+  // every named/local install + re-spawn path: lifecycle install, the
+  // hot workspace install (`installBundleInWorkspace`), connector eager-
+  // start, configure-restart, boot reload — all reach this point with
+  // the manifest loaded but before the subprocess is started, so a
+  // refused install never leaves a leaked process behind. URL bundles
+  // have `manifest = null` and are skipped (they have no MCPB manifest).
+  if (manifest) {
+    assertHostCapabilitiesAvailable(manifest, manifest.name);
   }
 
   await source.start();
