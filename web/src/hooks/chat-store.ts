@@ -102,6 +102,9 @@ export interface ChatMessage {
   userId?: string;
   files?: MessageFileAttachment[];
   stopReason?: string;
+  /** Loaded-from-disk turn with no terminal event yet (run still in flight when
+   *  read). Drives the resume reconcile — a partial snapshot vs a finished turn. */
+  pending?: boolean;
   error?: string;
   usage?: {
     inputTokens: number;
@@ -450,6 +453,15 @@ export function createChatStore(): ChatStore {
     }
   }
 
+  /** True when the loaded disk tail is an unfinished turn — a trailing user
+   *  message (no assistant yet) or an assistant flagged `pending` (read before
+   *  its run.done). Distinguishes a partial snapshot from a finished turn. */
+  function hasPendingTail(slice: ConversationSlice): boolean {
+    const last = slice.messages[slice.messages.length - 1];
+    if (!last) return false;
+    return last.role === "user" || last.pending === true;
+  }
+
   // -- subscription --
 
   function closeConnection(slice: ConversationSlice): void {
@@ -472,22 +484,36 @@ export function createChatStore(): ChatStore {
       onSubscribed: (info) => {
         if (slice.resumeOnSubscribe) {
           slice.resumeOnSubscribe = false;
-          if (info.isActive) {
-            // A turn is in flight — trim the stale in-flight turn loaded from
-            // disk; the RunBus replay rebuilds it from the top. Reflect the
-            // server's "is generating" truth immediately so the streaming
-            // indicator (and Stop button) show on resume without waiting for
-            // the first replayed event.
+          const pendingTail = hasPendingTail(slice);
+          if (info.isActive || (pendingTail && info.activeSeq > 0)) {
+            // Either a live turn, OR a turn that finished in the load→subscribe
+            // window but is still retained in the RunBus grace buffer (partial
+            // disk tail + a retained run). Either way the replay carries the
+            // full trailing turn — trim the stale/partial disk copy so the
+            // replay rebuilds it without duplicating. For a live turn, reflect
+            // the streaming indicator immediately; for a just-finished one the
+            // replayed `done` finalizes it.
             trimTrailingTurn(slice);
             resetScratch(slice);
-            slice.isStreaming = true;
-            if (!slice.streamingState) slice.streamingState = "thinking";
+            if (info.isActive) {
+              slice.isStreaming = true;
+              if (!slice.streamingState) slice.streamingState = "thinking";
+            }
             commit(slice);
             return;
           }
+          if (pendingTail) {
+            // Partial disk tail but the run is gone (grace GC'd) — no replay can
+            // complete it. Refetch the now-complete transcript.
+            dropEvents = true;
+            closeConnection(slice);
+            void loadConversation(conversationId);
+            return;
+          }
           if (!slice.isStreaming) {
-            // Nothing in flight and we're not sending — ignore the trailing
-            // grace-buffer replay (already in disk history) and detach.
+            // Complete disk tail (or idle) — ignore any stray grace-buffer
+            // replay; it would duplicate (and flicker) a turn already fully on
+            // disk.
             dropEvents = true;
             closeConnection(slice);
             return;

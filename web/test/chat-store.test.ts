@@ -25,6 +25,12 @@ const LOADED: ChatMessage[] = [
   { role: "assistant", content: "loaded-a", blocks: [{ type: "text", text: "loaded-a" }] },
 ];
 
+// A partial disk snapshot: the trailing assistant has no terminal event yet.
+const PENDING_LOADED: ChatMessage[] = [
+  { role: "user", content: "loaded-q" },
+  { role: "assistant", content: "part", blocks: [{ type: "text", text: "part" }], pending: true },
+];
+
 mock.module("../src/api/conversation-stream", () => ({
   connectConversationStream: (opts: {
     conversationId: string;
@@ -61,7 +67,10 @@ mock.module("../src/api/client", () => ({
   callTool: (_server: string, _action: string, args?: Record<string, unknown>) =>
     Promise.resolve({
       isError: false,
-      structuredContent: { metadata: { id: args?.id }, messages: LOADED },
+      structuredContent: {
+        metadata: { id: args?.id },
+        messages: args?.id === "conv_pending" ? PENDING_LOADED : LOADED,
+      },
     }),
 }));
 
@@ -285,6 +294,36 @@ describe("chat-store viewer", () => {
     expect(store.getSnapshot("A").streamingState).toBeNull();
     // Last-seen partial is retained (a reload would fetch the final transcript).
     expect(lastAssistant(store.getSnapshot("A").messages)?.content).toBe("partial");
+  });
+
+  it("completes a partial disk tail from the grace replay on resume (no dup)", async () => {
+    const store = createChatStore();
+    await store.loadConversation("conv_pending");
+    expect(lastAssistant(store.getSnapshot("conv_pending").messages)?.content).toBe("part");
+
+    // Turn finished in the load→subscribe window but is still graced: not
+    // active, retained run (activeSeq>0). The replay carries the full turn.
+    const s = latestStream();
+    s.onSubscribed?.({ isActive: false, activeSeq: 5 });
+    s.onEvent("user.message", { content: "loaded-q" }, 1);
+    s.onEvent("text.delta", { text: "full answer" }, 2);
+    s.onEvent("done", { conversationId: "conv_pending", response: "full answer" }, 3);
+
+    const msgs = store.getSnapshot("conv_pending").messages;
+    expect(lastAssistant(msgs)?.content).toBe("full answer");
+    expect(msgs.filter((m) => m.role === "user").length).toBe(1); // no duplicate turn
+  });
+
+  it("keeps a complete disk tail intact when a graced replay is available (no flicker)", async () => {
+    const store = createChatStore();
+    await store.loadConversation("conv_done2");
+    const s = latestStream();
+    // Complete tail + retained run: the grace replay must be ignored (not
+    // trimmed+rebuilt) so the just-opened turn doesn't blink out and back.
+    s.onSubscribed?.({ isActive: false, activeSeq: 9 });
+    s.onEvent("user.message", { content: "loaded-q" }, 1);
+    s.onEvent("done", { conversationId: "conv_done2", response: "loaded-a" }, 2);
+    expect(store.getSnapshot("conv_done2").messages).toEqual(LOADED);
   });
 
   it("does not duplicate a finished turn whose grace-buffer replay still arrives", async () => {
