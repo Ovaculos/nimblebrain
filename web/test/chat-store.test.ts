@@ -269,6 +269,24 @@ describe("chat-store viewer", () => {
     expect(store.getSnapshot("conv_absent").title).toBeNull();
   });
 
+  it("clears a stuck stream when a reconnect reports the turn already ended", async () => {
+    const store = createChatStore();
+    await store.sendTurn("kA", { text: "a" });
+    const s = latestStream();
+    s.onEvent("chat.start", { conversationId: "A" }, 1);
+    s.onEvent("text.delta", { text: "partial" }, 2);
+    expect(store.getSnapshot("A").isStreaming).toBe(true);
+
+    // Reconnect after the turn ended while disconnected past the grace window:
+    // server says not active and the terminal frame was GC'd (no replay).
+    s.onSubscribed?.({ isActive: false, activeSeq: 0 });
+
+    expect(store.getSnapshot("A").isStreaming).toBe(false);
+    expect(store.getSnapshot("A").streamingState).toBeNull();
+    // Last-seen partial is retained (a reload would fetch the final transcript).
+    expect(lastAssistant(store.getSnapshot("A").messages)?.content).toBe("partial");
+  });
+
   it("does not duplicate a finished turn whose grace-buffer replay still arrives", async () => {
     const store = createChatStore();
     // Disk already has the completed turn.

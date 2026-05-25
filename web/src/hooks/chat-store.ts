@@ -483,12 +483,29 @@ export function createChatStore(): ChatStore {
             slice.isStreaming = true;
             if (!slice.streamingState) slice.streamingState = "thinking";
             commit(slice);
-          } else if (!slice.isStreaming) {
+            return;
+          }
+          if (!slice.isStreaming) {
             // Nothing in flight and we're not sending — ignore the trailing
             // grace-buffer replay (already in disk history) and detach.
             dropEvents = true;
             closeConnection(slice);
+            return;
           }
+        }
+        // Server-authoritative reconcile: the server says no turn is running,
+        // but we still think we're streaming. Happens when a viewer reconnects
+        // after the turn ended while disconnected past the RunBus grace window
+        // — the terminal frame was GC'd, so it will never replay and the spinner
+        // would hang forever. Clear it. A terminal frame still within grace
+        // arrives in the replay that follows and finalizes the content; if it
+        // was GC'd, the slice keeps its last-seen partial (a reload fetches the
+        // final) — either way we stop hanging.
+        if (!info.isActive && slice.isStreaming) {
+          slice.isStreaming = false;
+          slice.streamingState = null;
+          slice.preparingTool = null;
+          commit(slice);
         }
       },
       onEvent: (type, data) => {
