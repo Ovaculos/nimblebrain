@@ -170,6 +170,11 @@ export class ConversationEventManager {
    * explicit policy gates; until then, this is the only exclusion
    * shape needed.
    *
+   * Seq-less: unlike {@link publishEvent} (the RunBus path), these frames carry
+   * no `id:` sequence. A seq-tracking `conversation-stream` viewer applies them
+   * live but can't replay/resume them. Only `/v1/chat` + `/v1/chat/stream` use
+   * this; the web shell is RunBus-only.
+   *
    * @param conversationId - Target conversation
    * @param eventType - SSE event type (e.g. "text.delta", "user.message")
    * @param data - Event data payload
