@@ -5,13 +5,10 @@ import type {
   BootstrapResponse,
   ChatRequest,
   ChatResult,
-  ChatStreamEventMap,
-  ChatStreamEventType,
   HealthInfo,
   PlacementEntry,
   ToolCallResult,
 } from "../types";
-import { getConversationSubscriberId } from "./conversation-sse";
 import { createFetchWithRefresh } from "./fetch-with-refresh";
 
 // ---------------------------------------------------------------------------
@@ -339,141 +336,6 @@ export async function chat(req: ChatRequest): Promise<ChatResult> {
     method: "POST",
     body: JSON.stringify(req),
   });
-}
-
-type ChatStreamCallback = <K extends ChatStreamEventType>(
-  type: K,
-  data: ChatStreamEventMap[K],
-) => void;
-
-/** Parse SSE events from a streaming response body. */
-async function consumeSSEStream(res: Response, onEvent: ChatStreamCallback): Promise<void> {
-  const reader = res.body?.getReader();
-  if (!reader) throw new Error("No response body");
-
-  const decoder = new TextDecoder();
-  let buffer = "";
-
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() ?? "";
-
-    let currentEvent = "";
-    for (const line of lines) {
-      if (line.startsWith("event: ")) {
-        currentEvent = line.slice(7).trim();
-      } else if (line.startsWith("data: ") && currentEvent) {
-        try {
-          const data = JSON.parse(line.slice(6));
-          onEvent(currentEvent as ChatStreamEventType, data);
-        } catch {
-          // Skip malformed data lines
-        }
-        currentEvent = "";
-      }
-    }
-  }
-}
-
-/** Streaming chat via SSE. Calls onEvent for each event, resolves when done.
- *  `signal` is for caller-driven cleanup (logout / store reset) — NOT
- *  conversation switching, which keeps the stream alive in the background. */
-export async function streamChat(
-  req: ChatRequest,
-  onEvent: ChatStreamCallback,
-  signal?: AbortSignal,
-): Promise<void> {
-  // If a conv-events SSE subscription is open for this conversation,
-  // pass its server-issued subscriber id so the broadcast suppresses
-  // self-echo. Without this, the sender's own tab double-processes
-  // every event (once via the streamed HTTP response below, once via
-  // its conv-events subscription).
-  const originSubId = req.conversationId
-    ? getConversationSubscriberId(req.conversationId)
-    : undefined;
-  const res = await fetchWithRefresh(`${API_BASE}/v1/chat/stream`, {
-    method: "POST",
-    credentials: "include",
-    headers: headers(originSubId ? { "X-Origin-Subscriber-Id": originSubId } : undefined),
-    body: JSON.stringify(req),
-    ...(signal ? { signal } : {}),
-  });
-
-  if (res.status === 401) {
-    throw new ApiClientError("unauthorized", "Unauthorized", 401);
-  }
-
-  if (!res.ok) {
-    const body: ApiError = await res.json().catch(() => ({
-      error: "unknown",
-      message: res.statusText,
-    }));
-    throw new ApiClientError(body.error, body.message, res.status, body.details);
-  }
-
-  await consumeSSEStream(res, onEvent);
-}
-
-/**
- * Streaming chat via SSE with file attachments (multipart/form-data).
- * When files are present, sends a FormData body instead of JSON.
- * SSE streaming works identically for both content types.
- */
-export async function streamChatMultipart(
-  req: ChatRequest,
-  files: File[],
-  onEvent: ChatStreamCallback,
-  signal?: AbortSignal,
-): Promise<void> {
-  const formData = new FormData();
-  formData.append("message", req.message);
-  if (req.conversationId) formData.append("conversationId", req.conversationId);
-  if (req.model) formData.append("model", req.model);
-  if (req.appContext) formData.append("appContext", JSON.stringify(req.appContext));
-  for (const file of files) {
-    formData.append("files", file, file.name);
-  }
-
-  // Build headers WITHOUT Content-Type — let the browser set multipart boundary
-  const h: Record<string, string> = {};
-  if (authToken && authToken !== "__cookie__") {
-    h.Authorization = `Bearer ${authToken}`;
-  }
-  if (activeWorkspaceId) {
-    h["X-Workspace-Id"] = activeWorkspaceId;
-  }
-  // Suppress self-echo on the conv-events subscription — see
-  // `streamChat` above for why this matters.
-  if (req.conversationId) {
-    const originSubId = getConversationSubscriberId(req.conversationId);
-    if (originSubId) h["X-Origin-Subscriber-Id"] = originSubId;
-  }
-
-  const res = await fetchWithRefresh(`${API_BASE}/v1/chat/stream`, {
-    method: "POST",
-    credentials: "include",
-    headers: h,
-    body: formData,
-    ...(signal ? { signal } : {}),
-  });
-
-  if (res.status === 401) {
-    throw new ApiClientError("unauthorized", "Unauthorized", 401);
-  }
-
-  if (!res.ok) {
-    const body: ApiError = await res.json().catch(() => ({
-      error: "unknown",
-      message: res.statusText,
-    }));
-    throw new ApiClientError(body.error, body.message, res.status, body.details);
-  }
-
-  await consumeSSEStream(res, onEvent);
 }
 
 /**

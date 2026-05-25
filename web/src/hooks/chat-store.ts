@@ -645,6 +645,8 @@ export function createChatStore(): ChatStore {
               llmMs: result.usage.llmMs,
             }
           : undefined;
+        // Cast: `files` is attached to the done payload by the server but isn't
+        // on the typed ChatResult — read it defensively.
         const resultFiles = (result as unknown as Record<string, unknown>).files as
           | MessageFileAttachment[]
           | undefined;
