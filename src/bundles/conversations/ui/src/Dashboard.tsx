@@ -1,4 +1,4 @@
-import { useAction, useDataSync, useSynapse } from "@nimblebrain/synapse/react";
+import { useAction, useDataSync, useHostContext, useSynapse } from "@nimblebrain/synapse/react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ConversationList } from "./ConversationList";
 import { groupByDate } from "./dateUtils";
@@ -11,6 +11,13 @@ type View = "list" | "search";
 export function Dashboard() {
   const synapse = useSynapse();
   const action = useAction();
+  // Conversations with an in-flight assistant turn in this tab — pushed by the
+  // host via hostContext. Drives a live per-row streaming indicator.
+  const { streamingConversationIds } = useHostContext<{ streamingConversationIds?: string[] }>();
+  const streamingIds = useMemo(
+    () => new Set(streamingConversationIds ?? []),
+    [streamingConversationIds],
+  );
 
   const [view, setView] = useState<View>("list");
   const [conversations, setConversations] = useState<ListResult["conversations"]>([]);
@@ -20,29 +27,38 @@ export function Dashboard() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const loadList = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const result = await synapse.callTool<Record<string, never>, ListResult>("list", {});
-      if (result.isError) {
-        setError("Failed to load conversations");
-        return;
+  // `background: true` refreshes data in place without flipping to the skeleton
+  // state — used for live data-changed refreshes so the list doesn't flicker.
+  // Rows are keyed by id, so React reconciles the swapped data without a
+  // visible reload. Skeletons are reserved for the initial load + view switches.
+  const loadList = useCallback(
+    async (opts?: { background?: boolean }) => {
+      if (!opts?.background) setLoading(true);
+      setError(null);
+      try {
+        const result = await synapse.callTool<Record<string, never>, ListResult>("list", {});
+        if (result.isError) {
+          setError("Failed to load conversations");
+          return;
+        }
+        setConversations(result.data.conversations || []);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Failed to load conversations");
+      } finally {
+        if (!opts?.background) setLoading(false);
       }
-      setConversations(result.data.conversations || []);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load conversations");
-    } finally {
-      setLoading(false);
-    }
-  }, [synapse]);
+    },
+    [synapse],
+  );
 
   const runSearch = useCallback(
-    async (query: string) => {
+    async (query: string, opts?: { background?: boolean }) => {
       setView("search");
       setSearchQuery(query);
-      setSearchResults(null);
-      setLoading(true);
+      if (!opts?.background) {
+        setSearchResults(null);
+        setLoading(true);
+      }
       setError(null);
       try {
         const result = await synapse.callTool<{ query: string }, SearchResultData>("search", {
@@ -56,7 +72,7 @@ export function Dashboard() {
       } catch (err) {
         setError(err instanceof Error ? err.message : "Search failed");
       } finally {
-        setLoading(false);
+        if (!opts?.background) setLoading(false);
       }
     },
     [synapse],
@@ -67,12 +83,15 @@ export function Dashboard() {
     loadList();
   }, [loadList]);
 
-  // Reload list/search on host data-changed broadcasts.
-  useDataSync(() => {
+  // Refresh on host data-changed broadcasts — but only for conversation
+  // changes (ignore unrelated apps' data.changed), and in the background so
+  // the list updates in place without a skeleton flicker.
+  useDataSync((event) => {
+    if (event.server !== "conversations") return;
     if (view === "list") {
-      loadList();
+      loadList({ background: true });
     } else if (view === "search" && searchQuery) {
-      runSearch(searchQuery);
+      runSearch(searchQuery, { background: true });
     }
   });
 
@@ -155,6 +174,7 @@ export function Dashboard() {
             groups={groups}
             activeFilter={activeFilter}
             totalConversations={conversations.length}
+            streamingIds={streamingIds}
             onOpen={handleOpenConversation}
           />
         )}
