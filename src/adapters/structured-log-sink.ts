@@ -92,7 +92,13 @@ export class StructuredLogSink implements EventSink {
   private writeLine(record: Record<string, unknown>): void {
     const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
     const filename = `nimblebrain-${today}.jsonl`;
-    appendFileSync(join(this.dir, filename), `${JSON.stringify(record)}\n`);
+    try {
+      appendFileSync(join(this.dir, filename), `${JSON.stringify(record)}\n`);
+    } catch {
+      // Best-effort logging: a write failure (disk full, perms, or a detached
+      // turn emitting after the workdir was torn down) must never throw into
+      // the event-emit path and crash the caller.
+    }
   }
 
   /** Remove log files older than the retention threshold. */

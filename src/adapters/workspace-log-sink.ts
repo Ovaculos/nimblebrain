@@ -64,7 +64,13 @@ export class WorkspaceLogSink implements EventSink {
 
     const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
     const filename = `${today}.jsonl`;
-    appendFileSync(join(this.dir, filename), `${JSON.stringify(record)}\n`);
+    try {
+      appendFileSync(join(this.dir, filename), `${JSON.stringify(record)}\n`);
+    } catch {
+      // Best-effort logging: a write failure (disk full, perms, or a detached
+      // turn emitting after the workdir was torn down) must never throw into
+      // the event-emit path and crash the caller.
+    }
   }
 
   /** No-op — kept for API compatibility. Writes are synchronous. */
