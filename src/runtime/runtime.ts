@@ -807,22 +807,37 @@ export class Runtime {
       ...(request.metadata ? { metadata: request.metadata } : {}),
     };
 
+    // Reserve the run (throws RunInProgressError if one is already active). The
+    // returned signal is the RunBus's — NOT the HTTP request's — so a client
+    // disconnect won't abort generation.
+    //
+    // For a provided id we begin BEFORE touching storage: `begin` is the
+    // serialization point, so a concurrent start with the same id is rejected
+    // here instead of both racing load()->null->create() and clobbering the
+    // file (create is a truncating writeFile with no exists-guard). On any
+    // load/create failure we `evict` to release the reservation — otherwise a
+    // failed start would leave the id stuck "running" and block future turns.
+    // A fresh conversation has no id until create(), so that path begins after.
     const isNew = !request.conversationId;
     let conversationId: string;
+    let signal: AbortSignal;
     if (request.conversationId) {
-      const existing = await store.load(request.conversationId);
-      if (existing && existing.ownerId !== ownerId) {
-        throw new ConversationAccessDeniedError(request.conversationId, ownerId);
+      signal = this.runBus.begin(request.conversationId);
+      try {
+        const existing = await store.load(request.conversationId);
+        if (existing && existing.ownerId !== ownerId) {
+          throw new ConversationAccessDeniedError(request.conversationId, ownerId);
+        }
+        conversationId =
+          existing?.id ?? (await store.create({ ...createOpts, id: request.conversationId })).id;
+      } catch (err) {
+        this.runBus.evict(request.conversationId);
+        throw err;
       }
-      conversationId =
-        existing?.id ?? (await store.create({ ...createOpts, id: request.conversationId })).id;
     } else {
       conversationId = (await store.create(createOpts)).id;
+      signal = this.runBus.begin(conversationId);
     }
-
-    // Reserve the run (throws if already active). The returned signal is the
-    // RunBus's — NOT the HTTP request's — so client disconnect won't abort.
-    const signal = this.runBus.begin(conversationId);
 
     // Seed the run stream with the user's message so the turn is
     // self-contained: any viewer (sender, other tab, post-refresh) can

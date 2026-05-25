@@ -1,8 +1,10 @@
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, beforeAll, describe, expect, it, spyOn } from "bun:test";
 import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EventSourcedConversationStore } from "../../src/conversation/event-sourced-store.ts";
+import type { ConversationAccessContext } from "../../src/conversation/types.ts";
+import { RunInProgressError } from "../../src/runtime/errors.ts";
 import { Runtime } from "../../src/runtime/runtime.ts";
 import type { BufferedRunEvent, RunStatus } from "../../src/runtime/run-bus.ts";
 import { createEchoModel } from "../helpers/echo-model.ts";
@@ -80,6 +82,43 @@ describe("detached turns (server-authoritative streaming)", () => {
     expect(store).toBeInstanceOf(EventSourcedConversationStore);
     const events = await (store as EventSourcedConversationStore).readEvents(conversationId);
     expect(events.length).toBeGreaterThan(0);
+  });
+
+  it("does not double-create on concurrent starts with the same provided id", async () => {
+    // Force both starts into the load→create window by delaying load. With the
+    // race fix (begin before storage), the loser's begin throws before it can
+    // create — so create runs exactly once. Without it, both create and the
+    // loser's truncating writeFile would clobber the winner's file.
+    const proto = EventSourcedConversationStore.prototype;
+    const realLoad = proto.load;
+    const loadSpy = spyOn(proto, "load").mockImplementation(async function (
+      this: EventSourcedConversationStore,
+      id: string,
+      access?: ConversationAccessContext,
+    ) {
+      await new Promise((r) => setTimeout(r, 25));
+      return realLoad.call(this, id, access);
+    });
+    const createSpy = spyOn(proto, "create");
+    try {
+      const id = "conv_face0000face0001"; // conv_ + 16 hex, not yet on disk
+      const results = await Promise.allSettled([
+        runtime.startTurn({ message: "a", conversationId: id, workspaceId: TEST_WORKSPACE_ID }),
+        runtime.startTurn({ message: "b", conversationId: id, workspaceId: TEST_WORKSPACE_ID }),
+      ]);
+
+      const createsForId = createSpy.mock.calls.filter(
+        (c) => (c[0] as { id?: string })?.id === id,
+      );
+      expect(createsForId.length).toBe(1);
+
+      const rejected = results.filter((r) => r.status === "rejected");
+      expect(rejected.length).toBe(1);
+      expect((rejected[0] as PromiseRejectedResult).reason).toBeInstanceOf(RunInProgressError);
+    } finally {
+      loadSpy.mockRestore();
+      createSpy.mockRestore();
+    }
   });
 
   it("allows a new turn on the same conversation once idle", async () => {
