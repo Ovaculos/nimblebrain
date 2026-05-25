@@ -517,13 +517,13 @@ export class WorkspaceCredentialStore {
 //
 // These remain for incremental migration. Every call site outside this
 // module is being moved to `WorkspaceCredentialStore` (or its owner
-// `WorkspaceContext`) in Stage 0 of the delegation-model refactor; once
+// `WorkspaceContext`) in Stage 0 of the cross-workspace refactor; once
 // the audit grep returns zero, the shims are deleted.
 
 /**
  * @deprecated Use `workspaceContext.getCredentialStore().get(bundleName)`.
  * Kept for incremental migration; will be removed once all call sites are
- * updated (see `.tasks/delegation-model/`).
+ * updated.
  */
 export async function getWorkspaceCredentials(
   wsId: string,

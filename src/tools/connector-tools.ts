@@ -17,9 +17,9 @@ import type { DirectoryEntry } from "../registries/types.ts";
 import type { Runtime } from "../runtime/runtime.ts";
 import { validateAdditionalAuthorizationParams } from "../util/oauth-params.ts";
 import { isHttpUrl } from "../util/url.ts";
+import type { Workspace } from "../workspace/types.ts";
 import { FileCredentialStore } from "./credential-store.ts";
 import type { InProcessTool } from "./in-process-app.ts";
-import { WorkspaceOAuthProvider } from "./workspace-oauth-provider.ts";
 
 /**
  * `manage_connectors` tool — single surface for the Connectors UI
@@ -27,15 +27,17 @@ import { WorkspaceOAuthProvider } from "./workspace-oauth-provider.ts";
  * MCP-tool-call surface is the canonical first-party API for the web
  * shell, and keeping one tool minimizes route bloat.
  *
- * Two scopes are routed in a single tool by inspecting the catalog
- * entry's `defaultScope` (or, for `list_installed` / `disconnect`,
- * looking up which store the bundle lives in):
+ * Stage 2: every install is workspace-scoped. The `install` action
+ * REQUIRES an explicit `wsId` argument — the UI picks the target
+ * workspace and passes it in; the tool hard-errors on missing `wsId`,
+ * mirroring Stage 1's `startBundleSource` precedent. No
+ * default-to-personal fallback inside the tool. `defaultBinding` on a
+ * catalog entry is a UX hint the picker consults to preselect a
+ * workspace; the tool itself never reads it to pick a target. The
+ * bundle ref's `oauthScope` is always `"workspace"`.
  *
- *   - `defaultScope: "workspace"` → `WorkspaceStore.bundles[]` +
- *     `workspaces/<wsId>/credentials/...` for tokens.
- *   - `defaultScope: "user"`      → `UserConnectorStore.bundles[]` +
- *     `users/<userId>/credentials/...` for tokens. Available across
- *     every workspace the user is a member of.
+ * Persistence: `WorkspaceStore.bundles[]` +
+ * `workspaces/<wsId>/credentials/...` for tokens.
  *
  * The `/v1/mcp-auth/{initiate,callback}` routes stay routes — the
  * initiate path sets a session-bound state cookie before redirecting,
@@ -224,6 +226,11 @@ export function createManageConnectorsTool(ctx: ManageConnectorsContext): InProc
           description:
             "DirectoryEntry to install (required for `install`). The same shape returned by list_directory — server dispatches by entry.install.kind. No id-to-action lookup; the registry that produced the entry is the source of truth for the install payload.",
         },
+        wsId: {
+          type: "string",
+          description:
+            "Target workspace id (required for `install`). The UI picks the workspace via the install dialog's WorkspaceTargetPicker and passes it explicitly; the tool hard-errors when missing. Stage 2: no default-to-personal fallback inside the tool — `defaultBinding` on the catalog entry is a UX hint the picker may consult, never read by this action.",
+        },
         clientId: {
           type: "string",
           description: "OAuth client_id (setup_operator only).",
@@ -239,9 +246,9 @@ export function createManageConnectorsTool(ctx: ManageConnectorsContext): InProc
         },
         scope: {
           type: "string",
-          enum: ["workspace", "user", "all"],
+          enum: ["workspace"],
           description:
-            "For list_installed: which scope to return (default 'all'). For disconnect / list_tools / get_permissions / set_permissions: which scope's connector to target (auto-detected for disconnect / list_tools when omitted; required for get/set permissions).",
+            "Stage 2: only `workspace` is accepted (legacy `user` scope was removed). Reserved for forward compatibility; defaults to `workspace`.",
         },
         tools: {
           type: "object",
@@ -290,7 +297,12 @@ export function createManageConnectorsTool(ctx: ManageConnectorsContext): InProc
             input.scope ? String(input.scope) : undefined,
           );
         case "install":
-          return handleInstall(ctx, wsId, identity, input.entry as unknown);
+          return handleInstall(
+            ctx,
+            identity,
+            input.entry as unknown,
+            input.wsId === undefined ? undefined : String(input.wsId),
+          );
         case "disconnect":
           return handleDisconnect(
             ctx,
@@ -436,7 +448,10 @@ async function handleListDirectory(
 async function handleListInstalled(
   ctx: ManageConnectorsContext,
   wsId: string | null,
-  callerId: string | null,
+  // Stage 2: callerId no longer disambiguates between workspace-scope
+  // and user-scope views (the latter was removed). Kept for signature
+  // stability across `handleGetInstalled`; ignored.
+  _callerId: string | null,
   scope: string,
   /**
    * When set, only build the entry for this specific serverName.
@@ -474,7 +489,10 @@ async function handleListInstalled(
     version: string;
     type: "remote" | "local";
     state: string;
-    scope: "workspace" | "user";
+    // Stage 2: only workspace-scope connectors exist. Personal connectors
+    // live in the caller's personal workspace; the legacy `"user"` arm was
+    // removed in T008/T009 — every population site below emits `"workspace"`.
+    scope: "workspace";
     interactive: boolean;
     toolCount: number;
     trustScore: number | null;
@@ -589,9 +607,6 @@ async function handleListInstalled(
     // needs to see it on this page to click Connect again.
     for (const instance of lifecycle.getInstances()) {
       if (instance.wsId !== wsId) continue;
-      // Skip user-scope URL bundles seeded into the workspace registry
-      // via UserPoolSource — those belong to the user-scope view.
-      if (instance.oauthScope === "user") continue;
       // Single-connector path: skip every non-matching instance
       // before doing any per-instance IO (tools() round-trip,
       // manifest probe, credential read).
@@ -716,74 +731,9 @@ async function handleListInstalled(
     }
   }
 
-  // User-scope entries (caller's own personal connectors). User scope
-  // doesn't have a "local" path today — every user-scope bundle is a
-  // URL connector with OAuth.
-  if ((scope === "all" || scope === "user") && callerId) {
-    const userRecord = await ctx.runtime.getUserConnectorStore().get(callerId);
-    if (userRecord) {
-      for (const ref of userRecord.bundles) {
-        if (!("url" in ref)) continue;
-        const serverName = ref.serverName ?? deriveServerName(ref.url);
-        if (onlyServerName && serverName !== onlyServerName) continue;
-        const userInstance = lifecycle.getUserInstance?.(serverName, callerId) ?? null;
-        const conn = userInstance?.connections?.get(callerId) ?? null;
-        // Mirror the workspace-scope match: prefer URL, fall back to
-        // catalog id for Composio-backed bundles whose URL is dynamic.
-        const composioConnectorId = (ref as { composio?: { connectorId?: string } }).composio
-          ?.connectorId;
-        let cat = catalogByUrl.get(ref.url);
-        if (!cat && composioConnectorId) {
-          cat = catalogById.get(composioConnectorId);
-        }
-
-        const interactive =
-          cat?.interactive === true ||
-          (Array.isArray(ref.ui?.placements) && ref.ui.placements.length > 0);
-
-        const entry: InstalledEntry = {
-          serverName,
-          bundleName: serverName,
-          version: userInstance?.version ?? "remote",
-          type: "remote",
-          state: conn?.state ?? userInstance?.state ?? "not_authenticated",
-          // Provisional — overwritten by deriveConnectorStatus below.
-          status: "ready",
-          scope: "user",
-          interactive,
-          toolCount: 0,
-          trustScore: userInstance?.trustScore ?? null,
-          url: ref.url,
-          catalogId: cat?.id ?? null,
-          ...(cat ? { catalog: cat } : {}),
-          ...(cat?.iconUrl ? { iconUrl: cat.iconUrl } : {}),
-          ...(conn?.authorizationUrl ? { authorizationUrl: conn.authorizationUrl } : {}),
-        };
-
-        // Read OIDC identity for the user's own provider, best-effort.
-        try {
-          const provider = new WorkspaceOAuthProvider({
-            owner: { type: "user", userId: callerId },
-            serverName,
-            workDir,
-            callbackUrl: "http://_/",
-          });
-          const id = await provider.identity();
-          if (id) entry.identity = id;
-        } catch {
-          // best-effort cosmetic data
-        }
-
-        // Same derivation as the workspace branch — keeps the two
-        // scopes producing the same shape for the UI.
-        const derived = deriveConnectorStatus(entry);
-        entry.status = derived.status;
-        if (derived.statusReason) entry.statusReason = derived.statusReason;
-
-        installed.push(entry);
-      }
-    }
-  }
+  // Stage 2: user-scope walk removed. Personal connectors now appear
+  // under the user's personal workspace at `ws_user_<userId>` — same
+  // workspace-scope rendering path as any other workspace.
 
   return {
     content: textContent(`Installed: ${installed.length} entries.`),
@@ -849,60 +799,55 @@ async function handleGetInstalled(
  */
 async function handleInstall(
   ctx: ManageConnectorsContext,
-  wsId: string | null,
   identity: UserIdentity | null,
   rawEntry: unknown,
+  wsIdArg: string | undefined,
 ): Promise<ToolResult> {
   const entry = parseDirectoryEntry(rawEntry);
   if (!entry) return errResult("entry with install action is required.");
-  const callerId = identity?.id ?? null;
+  if (!identity) return errResult("Authentication required.");
 
-  // Workspace allow-list — the workspace operator can scope which
-  // catalog ids are installable. Applies to every install kind.
-  // Workspace-scope installs additionally require admin role: the
-  // bundle joins the shared workspace surface (placements, tools,
-  // credentials inheritance), so a non-admin should not be able to
-  // unilaterally widen the workspace's tool/credential exposure.
-  // User-scope installs are self-targeted (per-user OAuth) and only
-  // require an authenticated identity, which the user-scope branches
-  // enforce inline.
-  const isWorkspaceScope =
-    entry.install.kind === "mpak-bundle" ||
-    (entry.install.kind === "remote-oauth" && entry.defaultScope === "workspace");
-  if (isWorkspaceScope) {
-    if (!wsId) return errResult("Workspace context required for workspace-scope install.");
-    if (!identity) return errResult("Authentication required.");
-    const ws = await ctx.runtime.getWorkspaceStore().get(wsId);
-    if (!ws) return errResult(`Workspace "${wsId}" not found.`);
-    if (!isWorkspaceAdmin(ws, identity)) {
-      return {
-        content: textContent("Workspace admin role required to install connectors."),
-        structuredContent: { error: "permission_denied" },
-        isError: true,
-      };
-    }
-    const allowList = ws.connectorsAllowList;
-    if (allowList && Array.isArray(allowList) && allowList.length > 0) {
-      if (!allowList.includes(entry.id)) {
-        return errResult(`Connector "${entry.id}" not visible in this workspace.`);
-      }
-    }
-  } else if (wsId) {
-    // User-scope path running with a workspace context still respects
-    // the allow-list — keeps the operator's curated set authoritative
-    // even for personal accounts.
-    const ws = await ctx.runtime.getWorkspaceStore().get(wsId);
-    const allowList = ws?.connectorsAllowList;
-    if (allowList && Array.isArray(allowList) && allowList.length > 0) {
-      if (!allowList.includes(entry.id)) {
-        return errResult(`Connector "${entry.id}" not visible in this workspace.`);
-      }
+  // Stage 2: `wsId` is REQUIRED for every install — the UI picks the
+  // target workspace via WorkspaceTargetPicker and passes it explicitly.
+  // No default-to-personal fallback inside the tool (Stage 1 precedent:
+  // `startBundleSource` hard-errors on missing wsId; pooling credentials
+  // across tenants via a silent default is the failure mode this guard
+  // forecloses).
+  const wsId = wsIdArg?.trim() ? wsIdArg.trim() : null;
+  if (!wsId) {
+    return errResult(
+      "wsId is required for install. The web shell's install dialog picks " +
+        "a target workspace via WorkspaceTargetPicker; clients calling this " +
+        "action directly must supply one explicitly. There is no default-to- " +
+        "personal fallback inside this tool.",
+    );
+  }
+  const ws = await ctx.runtime.getWorkspaceStore().get(wsId);
+  if (!ws) return errResult(`Workspace "${wsId}" not found.`);
+
+  // Admin role gates every install — workspace-shared connectors widen
+  // the workspace's tool / credential surface for every member, and
+  // personal workspaces invariably have the owner as admin (Stage 1
+  // invariant), so this gate also covers the personal-install path
+  // uniformly.
+  if (!isWorkspaceAdmin(ws, identity)) {
+    return {
+      content: textContent("Workspace admin role required to install connectors."),
+      structuredContent: { error: "permission_denied" },
+      isError: true,
+    };
+  }
+
+  const allowList = ws.connectorsAllowList;
+  if (allowList && Array.isArray(allowList) && allowList.length > 0) {
+    if (!allowList.includes(entry.id)) {
+      return errResult(`Connector "${entry.id}" not visible in this workspace.`);
     }
   }
 
   switch (entry.install.kind) {
     case "remote-oauth":
-      return handleInstallRemoteOAuth(ctx, wsId, callerId, entry);
+      return handleInstallRemoteOAuth(ctx, wsId, ws, entry);
     case "mpak-bundle":
       return handleInstallMpak(ctx, wsId, entry);
     case "direct-url":
@@ -989,16 +934,18 @@ function parseDirectoryEntry(input: unknown): DirectoryEntry | null {
 }
 
 /**
- * Remote OAuth install — workspace-scope or user-scope based on
- * `entry.defaultScope`. For static-auth (Asana, HubSpot, etc.) the
- * workspace must have operator OAuth client config persisted under
- * `workspace.json#oauthOperatorApps[entry.id]` + the matching
- * client_secret in the credential store before this can proceed.
+ * Remote OAuth install — targets the explicit `wsId` passed in by the
+ * dispatcher. Composio-auth entries additionally require a non-personal
+ * (shared) target workspace because their credential layout under
+ * `credentials/composio/<connectorId>/` only fits the shared-workspace
+ * shape today. Static-auth entries require operator OAuth client config
+ * persisted under `workspace.json#oauthOperatorApps[entry.id]` + the
+ * matching client_secret in the credential store before this can proceed.
  */
 async function handleInstallRemoteOAuth(
   ctx: ManageConnectorsContext,
-  wsId: string | null,
-  callerId: string | null,
+  wsId: string,
+  ws: Workspace,
   entry: DirectoryEntry,
 ): Promise<ToolResult> {
   if (entry.install.kind !== "remote-oauth") {
@@ -1015,20 +962,20 @@ async function handleInstallRemoteOAuth(
     if (!action.composio) {
       return errResult(`"${entry.name}" is composio-auth but missing composio config block.`);
     }
-    if (!wsId) return errResult("Workspace context required for composio-auth install.");
     // Composio's state lives at workspace scope only:
     // `credentials/composio/<connectorId>/connection.json` is under
     // `workspaces/<wsId>/`, and `lifecycle.disconnect`'s composio
-    // cleanup branch gates on `isWorkspaceScope`. A user-scoped
-    // composio entry would silently bypass that cleanup and orphan
-    // the upstream Composio account on disconnect. Reject at
-    // install time rather than ship the latent footgun. Lift this
-    // when the credential-path layout grows a user-scope arm.
-    if (entry.defaultScope !== "workspace") {
+    // cleanup branch gates on `isWorkspaceScope`. A personal-workspace
+    // target would silently bypass that cleanup and orphan the upstream
+    // Composio account on disconnect. Reject at install time rather
+    // than ship the latent footgun. The source of truth is the target
+    // workspace record's `isPersonal` flag (NOT the catalog's
+    // `defaultBinding` — that's a UX hint, not an authority).
+    if (ws.isPersonal === true) {
       return errResult(
-        `"${entry.name}" is composio-auth but defaultScope is "${entry.defaultScope}". ` +
-          "Composio-backed connectors are currently workspace-scoped only — " +
-          "the credential layout does not yet support user-scope.",
+        `"${entry.name}" is composio-auth and cannot install into a personal workspace — ` +
+          "the credential layout does not yet support personal-workspace bindings. " +
+          "Pick a shared workspace from the install dialog instead.",
       );
     }
     const { authConfigEnv } = action.composio;
@@ -1069,7 +1016,7 @@ async function handleInstallRemoteOAuth(
       }
     | { __err: string }
   > {
-    if (action.auth !== "composio" || !action.composio || !wsId) {
+    if (action.auth !== "composio" || !action.composio) {
       // Unreachable — guards above ensure the shape. Typed for the
       // caller's narrowing convenience.
       return { __err: "composio wiring requested for non-composio install" };
@@ -1123,12 +1070,10 @@ async function handleInstallRemoteOAuth(
   async function loadStaticOAuthClient(): Promise<
     { clientId: string; clientSecretKey: string } | { __err: string }
   > {
-    if (action.auth !== "static" || !action.operatorSetup || !wsId) {
+    if (action.auth !== "static" || !action.operatorSetup) {
       return { __err: "static-auth wiring requested for non-static install" };
     }
     const setup = action.operatorSetup;
-    const ws = await ctx.runtime.getWorkspaceStore().get(wsId);
-    if (!ws) return { __err: `Workspace "${wsId}" not found.` };
     const operatorApp = ws.oauthOperatorApps?.[entry.id];
     if (!operatorApp?.clientId) {
       return {
@@ -1161,7 +1106,11 @@ async function handleInstallRemoteOAuth(
       // for vendors whose remote `type` is `sse` — PayPal / Cloudflare /
       // Webflow / Wix in the bundled catalog today.
       transport: composioWiring?.transport ?? { type: action.transportType },
-      oauthScope: entry.defaultScope,
+      // Post-Stage-2: every ref's oauthScope is "workspace". The catalog's
+      // `defaultBinding` selects which workspace the install targets
+      // (personal vs active), NOT a per-ref scope literal — see the
+      // dispatch logic above.
+      oauthScope: "workspace",
       ...(action.requiredScopes ? { scopes: action.requiredScopes } : {}),
       ...(action.additionalAuthorizationParams
         ? { additionalAuthorizationParams: action.additionalAuthorizationParams }
@@ -1183,209 +1132,148 @@ async function handleInstallRemoteOAuth(
 
   const lifecycle = ctx.runtime.getLifecycle();
 
-  if (entry.defaultScope === "workspace") {
-    if (!wsId) return errResult("Workspace context required for workspace-scope install.");
-    const ws = await ctx.runtime.getWorkspaceStore().get(wsId);
-    if (!ws) return errResult(`Workspace "${wsId}" not found.`);
+  // Single install pipeline keyed on the explicit `wsId` the caller
+  // supplied. The personal vs shared-workspace distinction is a
+  // property of the target workspace (`ws.isPersonal`), not a separate
+  // code path — both produce the same `BundleRef` shape and the same
+  // workspace-scoped credential layout. Personal-target installs
+  // surface as a different message string in `content` but identical
+  // `structuredContent`.
+  const isPersonalTarget = ws.isPersonal === true;
 
-    // Dedup primarily on `serverName` — the canonical lifecycle key
-    // (workspace registry name + workspace.json index), derived from
-    // `entry.id` and stable across installs. Matching on `b.url` would
-    // miss composio-backed bundles whose persisted `b.url` is the
-    // per-install Composio session URL (set from `composioWiring.url`)
-    // and never equals the catalog placeholder `action.url`.
-    // Fall back to URL match for legacy bundles persisted before
-    // #195's slugify-on-install (no `serverName` field on disk).
-    const dup = ws.bundles.find((b) => {
-      if (!("url" in b)) return false;
-      if ("serverName" in b && b.serverName) return b.serverName === serverName;
-      return b.url === action.url;
-    });
-    if (dup) {
-      const dupServerName = "serverName" in dup ? (dup.serverName ?? serverName) : serverName;
-      // Self-heal: workspace.json says yes but lifecycle lost the
-      // instance (prior uninstall that didn't clean workspace.json).
-      // Re-seed instead of reporting alreadyInstalled — the latter
-      // would skip seedInstance and fail the next OAuth initiate.
-      if (!lifecycle.getInstance(dupServerName, wsId)) {
-        const wsRegistry = ctx.runtime.getRegistryForWorkspace(wsId);
-        lifecycle.seedInstance(
-          dupServerName,
-          action.url,
-          dup,
-          undefined,
-          wsId,
-          undefined,
-          wsRegistry,
-        );
-        lifecycle.notifyInstalled(dupServerName, wsId);
-        return {
-          content: textContent(`Reattached "${entry.name}" (recovered orphan entry).`),
-          structuredContent: {
-            ok: true,
-            alreadyInstalled: false,
-            serverName: dupServerName,
-            scope: "workspace",
-          },
-          isError: false,
-        };
-      }
-      return {
-        content: textContent(`"${entry.name}" already installed.`),
-        structuredContent: {
-          ok: true,
-          alreadyInstalled: true,
-          serverName: dupServerName,
-          scope: "workspace",
-        },
-        isError: false,
-      };
-    }
-    // Fresh-install: resolve the wiring now that we know we're going
-    // to commit. Composio session create and operator-credential read
-    // are gated here so a duplicate-install click (caught above) never
-    // burns an upstream Composio session or reads the credential.
-    let composioWiring: { url: string; transport: RemoteTransportConfig } | undefined;
-    if (action.auth === "composio") {
-      const wiring = await buildComposioWiring();
-      if ("__err" in wiring) return errResult(wiring.__err);
-      composioWiring = wiring;
-    }
-    let staticOAuthClient: { clientId: string; clientSecretKey: string } | undefined;
-    if (action.auth === "static") {
-      const client = await loadStaticOAuthClient();
-      if ("__err" in client) return errResult(client.__err);
-      staticOAuthClient = client;
-    }
-    const ref = buildRef(composioWiring, staticOAuthClient);
-    await ctx.runtime.getWorkspaceStore().update(wsId, { bundles: [...ws.bundles, ref] });
-    const wsRegistry = ctx.runtime.getRegistryForWorkspace(wsId);
-    lifecycle.seedInstance(serverName, action.url, ref, undefined, wsId, undefined, wsRegistry);
-    lifecycle.notifyInstalled(serverName, wsId);
-    // Composio-backed URL bundles authenticate via static header
-    // (x-api-key) — no MCP-side OAuth flow is needed to start the
-    // source, so kick it off here rather than waiting for the next
-    // platform boot. Tool listing works regardless of whether the
-    // user has completed Composio's OAuth dance yet; tool execution
-    // returns Composio's "not connected" errors until they do.
-    // For static / dcr bundles, source.start() is bound to
-    // `lifecycle.startAuth` (called from `/v1/mcp-auth/initiate`)
-    // and shouldn't run here.
-    //
-    // Eager-start is a UX optimization (instant tool list). If it
-    // fails the install itself has still succeeded — the BundleRef
-    // is in workspace.json, seedInstance has run, the next Connect
-    // click runs the same `ensureSourceRegistered` path as a normal
-    // reconnect and will start the source. Surfacing this as a hard
-    // error to the user would say "install failed" while the bundle
-    // is in fact installed. Return success with a warning instead
-    // so the agent can communicate "installed, eager-start failed,
-    // click Connect" cleanly.
-    let startWarning: string | undefined;
-    if (action.auth === "composio") {
-      try {
-        await startBundleSource(ref, wsRegistry, ctx.runtime.getEventSink(), undefined, {
-          allowInsecureRemotes: ctx.runtime.getAllowInsecureRemotes(),
-          wsId,
-          workDir: ctx.runtime.getWorkDir(),
-          bundleMcp: ctx.runtime.getBundleMcpDeps(wsId),
-        });
-        // Source is now registered and `tools/list` works. State is NOT
-        // forced here — `seedInstance` (above) already derived the
-        // correct value: `not_authenticated` when no `connection.json`
-        // exists yet (first install — user still needs to OAuth), or
-        // `running` when one carries over from a prior session
-        // (reinstall without prior disconnect). Forcing `running` here
-        // would mask the auth-required signal on a fresh install if
-        // the user closes the OAuth tab before consenting, leaving the
-        // connector showing "Ready" with no Connect affordance and
-        // tool calls failing at Composio.
-      } catch (err) {
-        startWarning = err instanceof Error ? err.message : String(err);
-        log.warn(
-          `[connector-tools] composio eager-start failed for ${entry.name} in ${wsId} ` +
-            `(install succeeded; click Connect to retry): ${startWarning}`,
-        );
-      }
-    }
-    return {
-      content: textContent(
-        startWarning
-          ? `Installed "${entry.name}" for this workspace. Source eager-start failed (${startWarning}) — click Connect to retry.`
-          : `Installed "${entry.name}" for this workspace.`,
-      ),
-      structuredContent: {
-        ok: true,
-        alreadyInstalled: false,
-        serverName,
-        scope: "workspace",
-        ...(startWarning ? { warning: startWarning } : {}),
-      },
-      isError: false,
-    };
-  }
-
-  // User scope
-  if (!callerId) {
-    return errResult("Authentication required to install personal connectors.");
-  }
-  const userStore = ctx.runtime.getUserConnectorStore();
-  const existing = await userStore.get(callerId);
-  // serverName-based dedup with legacy URL fallback — same rationale
-  // as the workspace branch above. Composio install is workspace-scope
-  // only today, but keeping both branches uniform avoids future drift.
-  const dup = existing?.bundles.find((b) => {
+  // Dedup primarily on `serverName` — the canonical lifecycle key
+  // (workspace registry name + workspace.json index), derived from
+  // `entry.id` and stable across installs. Matching on `b.url` would
+  // miss composio-backed bundles whose persisted `b.url` is the
+  // per-install Composio session URL (set from `composioWiring.url`)
+  // and never equals the catalog placeholder `action.url`.
+  // Fall back to URL match for legacy bundles persisted before
+  // #195's slugify-on-install (no `serverName` field on disk).
+  const dup = ws.bundles.find((b) => {
     if (!("url" in b)) return false;
     if ("serverName" in b && b.serverName) return b.serverName === serverName;
     return b.url === action.url;
   });
   if (dup) {
-    // Mirror workspace branch (line 1045): fall back to the slugified
-    // serverName, never the raw `entry.id` — the latter is the
-    // canonical reverse-DNS form which contains `/` and would feed
-    // slashes into the lifecycle Map key, UserPoolSource name, and
-    // the structuredContent the web shell consumes as a route segment.
     const dupServerName = "serverName" in dup ? (dup.serverName ?? serverName) : serverName;
-    // Self-heal symmetric to workspace scope.
-    if (!lifecycle.getUserInstance?.(dupServerName, callerId)) {
-      await lifecycle.seedUserInstance?.(dupServerName, dup, callerId);
+    // Self-heal: workspace.json says yes but lifecycle lost the
+    // instance (prior uninstall that didn't clean workspace.json).
+    // Re-seed instead of reporting alreadyInstalled — the latter
+    // would skip seedInstance and fail the next OAuth initiate.
+    if (!lifecycle.getInstance(dupServerName, wsId)) {
+      const wsRegistry = ctx.runtime.getRegistryForWorkspace(wsId);
+      lifecycle.seedInstance(
+        dupServerName,
+        action.url,
+        dup,
+        undefined,
+        wsId,
+        undefined,
+        wsRegistry,
+      );
+      lifecycle.notifyInstalled(dupServerName, wsId);
       return {
         content: textContent(`Reattached "${entry.name}" (recovered orphan entry).`),
         structuredContent: {
           ok: true,
           alreadyInstalled: false,
           serverName: dupServerName,
-          scope: "user",
+          scope: "workspace",
+          wsId,
         },
         isError: false,
       };
     }
     return {
-      content: textContent(`"${entry.name}" already installed for your account.`),
+      content: textContent(
+        isPersonalTarget
+          ? `"${entry.name}" already installed in your personal workspace.`
+          : `"${entry.name}" already installed.`,
+      ),
       structuredContent: {
         ok: true,
         alreadyInstalled: true,
         serverName: dupServerName,
-        scope: "user",
+        scope: "workspace",
+        wsId,
       },
       isError: false,
     };
   }
-  // User-scope is DCR-only today (composio and static are enforced
-  // workspace-scope above), so no composio session create or operator
-  // credential read happens here — build the ref directly.
-  const ref = buildRef(undefined, undefined);
-  await userStore.addBundle(callerId, ref);
-  await lifecycle.seedUserInstance?.(serverName, ref, callerId);
+
+  // Fresh-install: resolve the wiring now that we know we're going
+  // to commit. Composio session create and operator-credential read
+  // are gated here so a duplicate-install click (caught above) never
+  // burns an upstream Composio session or reads the credential.
+  let composioWiring: { url: string; transport: RemoteTransportConfig } | undefined;
+  if (action.auth === "composio") {
+    const wiring = await buildComposioWiring();
+    if ("__err" in wiring) return errResult(wiring.__err);
+    composioWiring = wiring;
+  }
+  let staticOAuthClient: { clientId: string; clientSecretKey: string } | undefined;
+  if (action.auth === "static") {
+    const client = await loadStaticOAuthClient();
+    if ("__err" in client) return errResult(client.__err);
+    staticOAuthClient = client;
+  }
+  const ref = buildRef(composioWiring, staticOAuthClient);
+  await ctx.runtime.getWorkspaceStore().update(wsId, { bundles: [...ws.bundles, ref] });
+  const wsRegistry = ctx.runtime.getRegistryForWorkspace(wsId);
+  lifecycle.seedInstance(serverName, action.url, ref, undefined, wsId, undefined, wsRegistry);
+  lifecycle.notifyInstalled(serverName, wsId);
+
+  // Composio-backed URL bundles authenticate via static header
+  // (x-api-key) — no MCP-side OAuth flow is needed to start the
+  // source, so kick it off here rather than waiting for the next
+  // platform boot. Tool listing works regardless of whether the
+  // user has completed Composio's OAuth dance yet; tool execution
+  // returns Composio's "not connected" errors until they do.
+  // For static / dcr bundles, source.start() is bound to
+  // `lifecycle.startAuth` (called from `/v1/mcp-auth/initiate`)
+  // and shouldn't run here.
+  //
+  // Eager-start is a UX optimization (instant tool list). If it
+  // fails the install itself has still succeeded — the BundleRef
+  // is in workspace.json, seedInstance has run, the next Connect
+  // click runs the same `ensureSourceRegistered` path as a normal
+  // reconnect and will start the source. Surfacing this as a hard
+  // error to the user would say "install failed" while the bundle
+  // is in fact installed. Return success with a warning instead
+  // so the agent can communicate "installed, eager-start failed,
+  // click Connect" cleanly.
+  let startWarning: string | undefined;
+  if (action.auth === "composio") {
+    try {
+      await startBundleSource(ref, wsRegistry, ctx.runtime.getEventSink(), undefined, {
+        allowInsecureRemotes: ctx.runtime.getAllowInsecureRemotes(),
+        wsId,
+        workDir: ctx.runtime.getWorkDir(),
+        bundleMcp: ctx.runtime.getBundleMcpDeps(wsId),
+      });
+    } catch (err) {
+      startWarning = err instanceof Error ? err.message : String(err);
+      log.warn(
+        `[connector-tools] composio eager-start failed for ${entry.name} in ${wsId} ` +
+          `(install succeeded; click Connect to retry): ${startWarning}`,
+      );
+    }
+  }
   return {
     content: textContent(
-      `Installed "${entry.name}" for your account. Available in every workspace you're in.`,
+      startWarning
+        ? `Installed "${entry.name}" in the target workspace. Source eager-start failed (${startWarning}) — click Connect to retry.`
+        : isPersonalTarget
+          ? `Installed "${entry.name}" in your personal workspace.`
+          : `Installed "${entry.name}" for this workspace.`,
     ),
     structuredContent: {
       ok: true,
       alreadyInstalled: false,
       serverName,
-      scope: "user",
+      scope: "workspace",
+      wsId,
+      ...(startWarning ? { warning: startWarning } : {}),
     },
     isError: false,
   };
@@ -1506,65 +1394,39 @@ async function handleDisconnect(
   scopeHint: string | undefined,
 ): Promise<ToolResult> {
   if (!serverName) return errResult("serverName is required.");
-  const callerId = identity?.id ?? null;
+  void scopeHint; // Stage 2: scopeHint is workspace-only and informational
   const lifecycle = ctx.runtime.getLifecycle();
 
-  // Auto-detect scope unless caller specified. Workspace-scope wins on
-  // ambiguity (same serverName installed both places — extremely rare;
-  // the catalog naming convention prevents it in practice).
-  let scope: "workspace" | "user" | undefined;
-  if (scopeHint === "workspace" || scopeHint === "user") {
-    scope = scopeHint;
-  } else if (wsId && lifecycle.getInstance(serverName, wsId)) {
-    scope = "workspace";
-  } else if (callerId && lifecycle.getUserInstance?.(serverName, callerId)) {
-    scope = "user";
+  // Stage 2: every connector is workspace-scoped. Personal connectors
+  // live in the caller's personal workspace; the caller is expected to
+  // disconnect them from that workspace context (the UI selects it).
+  if (!wsId) return errResult("Workspace context required.");
+  if (!identity) return errResult("Authentication required.");
+  if (!lifecycle.getInstance(serverName, wsId)) {
+    return errResult(`Bundle "${serverName}" not installed in workspace.`);
   }
-  if (!scope) {
-    return errResult(`Bundle "${serverName}" not installed.`);
+  // Workspace-scope disconnect revokes OAuth tokens used by every
+  // member of the workspace. A non-admin shouldn't be able to log
+  // the whole workspace out of a shared connector. Personal
+  // workspaces have a single admin (the owner) by invariant, so
+  // the same gate cleanly covers both shapes.
+  const ws = await ctx.runtime.getWorkspaceStore().get(wsId);
+  if (!ws) return errResult(`Workspace "${wsId}" not found.`);
+  if (!isWorkspaceAdmin(ws, identity)) {
+    return {
+      content: textContent("Workspace admin role required to disconnect shared connectors."),
+      structuredContent: { error: "permission_denied" },
+      isError: true,
+    };
   }
-
-  if (scope === "workspace") {
-    if (!wsId) return errResult("Workspace context required.");
-    if (!identity) return errResult("Authentication required.");
-    // Workspace-scope disconnect revokes OAuth tokens used by every
-    // member of the workspace. A non-admin shouldn't be able to log
-    // the whole workspace out of a shared connector.
-    const ws = await ctx.runtime.getWorkspaceStore().get(wsId);
-    if (!ws) return errResult(`Workspace "${wsId}" not found.`);
-    if (!isWorkspaceAdmin(ws, identity)) {
-      return {
-        content: textContent("Workspace admin role required to disconnect shared connectors."),
-        structuredContent: { error: "permission_denied" },
-        isError: true,
-      };
-    }
-    try {
-      const result = await lifecycle.disconnect(serverName, wsId, "_workspace", {
-        workDir: ctx.runtime.getWorkDir(),
-        allowInsecureRemotes: ctx.runtime.getAllowInsecureRemotes(),
-      });
-      return {
-        content: textContent(`Disconnected "${serverName}" from workspace.`),
-        structuredContent: { ok: true, scope: "workspace", ...result },
-        isError: false,
-      };
-    } catch (err) {
-      return errResult(err instanceof Error ? err.message : String(err));
-    }
-  }
-
-  // User scope
-  if (!callerId) return errResult("Authentication required.");
   try {
-    const result = await lifecycle.disconnectUser?.(serverName, callerId, {
+    const result = await lifecycle.disconnect(serverName, wsId, "_workspace", {
       workDir: ctx.runtime.getWorkDir(),
       allowInsecureRemotes: ctx.runtime.getAllowInsecureRemotes(),
     });
-    if (!result) return errResult("User-scope disconnect not implemented.");
     return {
-      content: textContent(`Disconnected "${serverName}" from your account.`),
-      structuredContent: { ok: true, scope: "user", ...result },
+      content: textContent(`Disconnected "${serverName}" from workspace.`),
+      structuredContent: { ok: true, scope: "workspace", ...result },
       isError: false,
     };
   } catch (err) {
@@ -1580,10 +1442,8 @@ async function handleDisconnect(
  * unregisters placements. For local bundles (stdio / non-OAuth URL),
  * just `lifecycle.uninstall`.
  *
- * User-scope: disconnectUser revokes + tears down. There is no user
- * equivalent of `lifecycle.uninstall` because user-scope bundles live
- * in `users/<id>/user.json`, not workspace.json — disconnect is the
- * uninstall.
+ * Stage 2: workspace-scope only. Personal connectors live in the user's
+ * personal workspace; uninstall from that workspace context.
  */
 async function handleUninstall(
   ctx: ManageConnectorsContext,
@@ -1593,146 +1453,90 @@ async function handleUninstall(
   scopeHint: string | undefined,
 ): Promise<ToolResult> {
   if (!serverName) return errResult("serverName is required.");
-  const callerId = identity?.id ?? null;
+  void scopeHint; // Stage 2: scopeHint is workspace-only and informational
   const lifecycle = ctx.runtime.getLifecycle();
 
-  let scope: "workspace" | "user" | undefined;
-  if (scopeHint === "workspace" || scopeHint === "user") {
-    scope = scopeHint;
-  } else if (wsId && lifecycle.getInstance(serverName, wsId)) {
-    scope = "workspace";
-  } else if (callerId && lifecycle.getUserInstance?.(serverName, callerId)) {
-    scope = "user";
+  // Stage 2: every connector is workspace-scoped. Personal connectors
+  // live in the caller's personal workspace; uninstall from that
+  // workspace context (the UI selects it).
+  if (!wsId) return errResult("Workspace context required.");
+  if (!identity) return errResult("Authentication required.");
+  if (!lifecycle.getInstance(serverName, wsId)) {
+    return errResult(`Bundle "${serverName}" not installed in workspace.`);
   }
-  if (!scope) {
-    return errResult(`Bundle "${serverName}" not installed.`);
+  // Workspace-scope uninstall removes a connector for every member
+  // of the workspace and clears the credential file. A non-admin
+  // shouldn't be able to remove a shared bundle other members rely on.
+  // Personal workspaces have a single admin (the owner) by invariant.
+  const ws = await ctx.runtime.getWorkspaceStore().get(wsId);
+  if (!ws) return errResult(`Workspace "${wsId}" not found.`);
+  if (!isWorkspaceAdmin(ws, identity)) {
+    return {
+      content: textContent("Workspace admin role required to uninstall shared connectors."),
+      structuredContent: { error: "permission_denied" },
+      isError: true,
+    };
   }
+  const instance = lifecycle.getInstance(serverName, wsId);
+  const ref = instance?.ref;
+  const isUrlBundle = !!ref && "url" in ref;
+  let revokeResult: { revoked?: { access?: boolean; refresh?: boolean }; revokeError?: string } =
+    {};
 
-  if (scope === "workspace") {
-    if (!wsId) return errResult("Workspace context required.");
-    if (!identity) return errResult("Authentication required.");
-    // Workspace-scope uninstall removes a connector for every member
-    // of the workspace and clears the credential file. A non-admin
-    // shouldn't be able to remove a shared bundle other members rely on.
-    const ws = await ctx.runtime.getWorkspaceStore().get(wsId);
-    if (!ws) return errResult(`Workspace "${wsId}" not found.`);
-    if (!isWorkspaceAdmin(ws, identity)) {
-      return {
-        content: textContent("Workspace admin role required to uninstall shared connectors."),
-        structuredContent: { error: "permission_denied" },
-        isError: true,
-      };
-    }
-    const instance = lifecycle.getInstance(serverName, wsId);
-    const ref = instance?.ref;
-    const isUrlBundle = !!ref && "url" in ref;
-    let revokeResult: { revoked?: { access?: boolean; refresh?: boolean }; revokeError?: string } =
-      {};
-
-    // Revoke OAuth tokens upstream first when applicable. Best-effort —
-    // a 4xx from the provider shouldn't block local cleanup, since the
-    // user's intent is "I want this gone."
-    if (isUrlBundle) {
-      try {
-        const r = await lifecycle.disconnect(serverName, wsId, "_workspace", {
-          workDir: ctx.runtime.getWorkDir(),
-          allowInsecureRemotes: ctx.runtime.getAllowInsecureRemotes(),
-        });
-        revokeResult = {
-          revoked: r.revoked,
-          ...(r.revokeError ? { revokeError: r.revokeError } : {}),
-        };
-      } catch (err) {
-        revokeResult = { revokeError: err instanceof Error ? err.message : String(err) };
-      }
-    }
-
+  // Revoke OAuth tokens upstream first when applicable. Best-effort —
+  // a 4xx from the provider shouldn't block local cleanup, since the
+  // user's intent is "I want this gone."
+  if (isUrlBundle) {
     try {
-      const registry = ctx.runtime.getRegistryForWorkspace(wsId);
-      // Capture the manifest name BEFORE lifecycle.uninstall — the
-      // instance reference is still valid afterwards but the lifecycle
-      // map drops it, and we need the name to strip the matching
-      // workspace.json entry.
-      const installedBundleName = instance?.bundleName;
-      await lifecycle.uninstall(serverName, registry, wsId);
-      // lifecycle.uninstall clears its own `instances` map and removes
-      // from the legacy global `nimblebrain.json`, but it does NOT
-      // touch `workspace.json#bundles[]` — that array was added later
-      // for catalog-installed connectors. Without this cleanup, a
-      // re-install attempt sees the leftover bundle, treats it as
-      // already-installed, skips seedInstance, and the next OAuth
-      // initiate fails with "Bundle X not installed." For stdio entries
-      // (`{ name: "@org/bundle" }`), missing this cleanup means the
-      // bundle reseeds at next boot — looking uninstalled in the UI but
-      // back in the registry after restart.
-      const ws = await ctx.runtime.getWorkspaceStore().get(wsId);
-      if (ws) {
-        const filtered = ws.bundles.filter((b) => {
-          if ("url" in b) {
-            const sn = b.serverName ?? deriveServerName(b.url);
-            return sn !== serverName;
-          }
-          if ("name" in b) {
-            // Match named entries by manifest name; the install path
-            // writes `{ name: bundleName }` so the same key is the
-            // authoritative match. Fall back to the install-time
-            // `{ name: serverName }` shape just in case.
-            return b.name !== installedBundleName && b.name !== serverName;
-          }
-          return true;
-        });
-        if (filtered.length !== ws.bundles.length) {
-          await ctx.runtime.getWorkspaceStore().update(wsId, { bundles: filtered });
-        }
-      }
-      // Drop tool permissions for this connector — they have no meaning
-      // once the bundle is gone.
-      await ctx.runtime
-        .getPermissionStore()
-        .deleteConnector({ scope: "workspace", wsId }, serverName);
-      return {
-        content: textContent(`Uninstalled "${serverName}" from workspace.`),
-        structuredContent: { ok: true, scope: "workspace", serverName, ...revokeResult },
-        isError: false,
+      const r = await lifecycle.disconnect(serverName, wsId, "_workspace", {
+        workDir: ctx.runtime.getWorkDir(),
+        allowInsecureRemotes: ctx.runtime.getAllowInsecureRemotes(),
+      });
+      revokeResult = {
+        revoked: r.revoked,
+        ...(r.revokeError ? { revokeError: r.revokeError } : {}),
       };
     } catch (err) {
-      return errResult(err instanceof Error ? err.message : String(err));
+      revokeResult = { revokeError: err instanceof Error ? err.message : String(err) };
     }
   }
 
-  // User scope — symmetric to workspace. disconnectUser revokes
-  // tokens upstream and removes the per-user McpSource from every
-  // workspace pool. Then we have to remove the entry from
-  // `users/<id>/user.json` ourselves; lifecycle.disconnectUser doesn't
-  // touch that file (parallel to the workspace.json gap above), so
-  // skipping this leaves a stale ref that breaks reinstall.
-  if (!callerId) return errResult("Authentication required.");
   try {
-    const result = await lifecycle.disconnectUser?.(serverName, callerId, {
-      workDir: ctx.runtime.getWorkDir(),
-      allowInsecureRemotes: ctx.runtime.getAllowInsecureRemotes(),
-    });
-    if (!result) return errResult("User-scope uninstall not implemented.");
-
-    const userStore = ctx.runtime.getUserConnectorStore();
-    const record = await userStore.get(callerId);
-    if (record) {
-      const filtered = record.bundles.filter((b) => {
-        if (!("url" in b)) return true;
-        const sn = b.serverName ?? deriveServerName(b.url);
-        return sn !== serverName;
+    const registry = ctx.runtime.getRegistryForWorkspace(wsId);
+    // Capture the manifest name BEFORE lifecycle.uninstall — the
+    // instance reference is still valid afterwards but the lifecycle
+    // map drops it, and we need the name to strip the matching
+    // workspace.json entry.
+    const installedBundleName = instance?.bundleName;
+    await lifecycle.uninstall(serverName, registry, wsId);
+    // lifecycle.uninstall clears its own `instances` map and removes
+    // from the legacy global `nimblebrain.json`, but it does NOT
+    // touch `workspace.json#bundles[]`. Strip the persisted entry
+    // here for both URL bundles and named entries.
+    const wsAfter = await ctx.runtime.getWorkspaceStore().get(wsId);
+    if (wsAfter) {
+      const filtered = wsAfter.bundles.filter((b) => {
+        if ("url" in b) {
+          const sn = b.serverName ?? deriveServerName(b.url);
+          return sn !== serverName;
+        }
+        if ("name" in b) {
+          return b.name !== installedBundleName && b.name !== serverName;
+        }
+        return true;
       });
-      if (filtered.length !== record.bundles.length) {
-        await userStore.update(callerId, { bundles: filtered });
+      if (filtered.length !== wsAfter.bundles.length) {
+        await ctx.runtime.getWorkspaceStore().update(wsId, { bundles: filtered });
       }
     }
-
+    // Drop tool permissions for this connector — they have no meaning
+    // once the bundle is gone.
     await ctx.runtime
       .getPermissionStore()
-      .deleteConnector({ scope: "user", userId: callerId }, serverName);
+      .deleteConnector({ scope: "workspace", wsId }, serverName);
     return {
-      content: textContent(`Uninstalled "${serverName}" from your account.`),
-      structuredContent: { ok: true, scope: "user", serverName, ...result },
+      content: textContent(`Uninstalled "${serverName}" from workspace.`),
+      structuredContent: { ok: true, scope: "workspace", serverName, ...revokeResult },
       isError: false,
     };
   } catch (err) {
@@ -1759,28 +1563,18 @@ async function handleListTools(
   scopeHint: string | undefined,
 ): Promise<ToolResult> {
   if (!serverName) return errResult("serverName is required.");
+  void scopeHint; // Stage 2: scopeHint is workspace-only and informational
+  void callerId; // unused post-Stage-2; kept for caller signature stability
   const lifecycle = ctx.runtime.getLifecycle();
 
-  let scope: "workspace" | "user" | undefined;
-  if (scopeHint === "workspace" || scopeHint === "user") {
-    scope = scopeHint;
-  } else if (wsId && lifecycle.getInstance(serverName, wsId)) {
-    scope = "workspace";
-  } else if (callerId && lifecycle.getUserInstance?.(serverName, callerId)) {
-    scope = "user";
-  }
-  if (!scope) {
-    return errResult(`Bundle "${serverName}" not installed.`);
+  // Stage 2: every connector is workspace-scoped. The caller must
+  // disambiguate the workspace (the UI selects it via the sidebar
+  // navigator — see Q1 in STAGE_2_DESIGN_DECISIONS.md).
+  if (!wsId) return errResult("Workspace context required.");
+  if (!lifecycle.getInstance(serverName, wsId)) {
+    return errResult(`Bundle "${serverName}" not installed in workspace.`);
   }
 
-  // Resolve the live source from the workspace registry. The registry
-  // owns the actual McpSource — workspace-scope bundles add it via
-  // startBundleSource at boot; user-scope bundles register a
-  // UserPoolSource at boot and per-user McpSources lazily. The
-  // connections map's `source` field is only populated on the user
-  // flow path (startAuth) and stays null for boot-restored bundles
-  // even though the bundle is fully running.
-  if (!wsId) return errResult("Workspace context required.");
   const registry = ctx.runtime.getRegistryForWorkspace(wsId);
   const source = registry.getSource(serverName);
   if (!source) {
@@ -1797,9 +1591,6 @@ async function handleListTools(
   }
 
   try {
-    // For user-scope (UserPoolSource), tools() needs to resolve a per-
-    // user source. Fall through naturally: UserPoolSource.tools() picks
-    // any registered user's source as a representative.
     const tools = await source.tools();
     // Strip the connector prefix from tool names. McpSource adds it
     // (`<serverName>__<bareName>`) for the registry's dispatch surface,
@@ -1842,22 +1633,15 @@ async function handleListToolsWithPermissions(
   scopeHint: string | undefined,
 ): Promise<ToolResult> {
   if (!serverName) return errResult("serverName is required.");
+  void scopeHint; // Stage 2: scopeHint is workspace-only and informational
 
   const lifecycle = ctx.runtime.getLifecycle();
-  let scope: "workspace" | "user" | undefined;
-  if (scopeHint === "workspace" || scopeHint === "user") {
-    scope = scopeHint;
-  } else if (wsId && lifecycle.getInstance(serverName, wsId)) {
-    scope = "workspace";
-  } else if (callerId && lifecycle.getUserInstance?.(serverName, callerId)) {
-    scope = "user";
-  }
-  if (!scope) {
-    return errResult(`Bundle "${serverName}" not installed.`);
-  }
   if (!wsId) return errResult("Workspace context required.");
+  if (!lifecycle.getInstance(serverName, wsId)) {
+    return errResult(`Bundle "${serverName}" not installed in workspace.`);
+  }
 
-  const owner = resolvePermissionOwner(wsId, callerId, scope);
+  const owner = resolvePermissionOwner(wsId, callerId, undefined);
   if (!owner) return errResult("Could not resolve permission owner — sign in or pick a workspace.");
 
   const registry = ctx.runtime.getRegistryForWorkspace(wsId);
@@ -1905,21 +1689,18 @@ async function handleListToolsWithPermissions(
 }
 
 /**
- * Resolve a scope+owner pair for permission read/write. User scope reads
- * the caller's own permissions; workspace scope reads the active
- * workspace's. Returns null on missing context.
+ * Resolve a workspace owner pair for permission read/write. Stage 2:
+ * permissions are workspace-scoped only (the legacy user-scope path is
+ * gone). Returns null when no workspace context is available.
  */
 function resolvePermissionOwner(
   wsId: string | null,
   callerId: string | null,
   scopeHint: string | undefined,
-): { scope: "workspace"; wsId: string } | { scope: "user"; userId: string } | null {
-  const scope: "workspace" | "user" =
-    scopeHint === "workspace" || scopeHint === "user" ? scopeHint : "workspace";
-  if (scope === "workspace") {
-    return wsId ? { scope: "workspace", wsId } : null;
-  }
-  return callerId ? { scope: "user", userId: callerId } : null;
+): { scope: "workspace"; wsId: string } | null {
+  void scopeHint; // Stage 2: only workspace scope is legal
+  void callerId; // unused post-Stage-2
+  return wsId ? { scope: "workspace", wsId } : null;
 }
 
 async function handleGetPermissions(
@@ -1958,12 +1739,9 @@ async function handleSetPermissions(
   // installed-source dispatch); failing fast here surfaces typos at
   // write time instead of letting them rot in the store.
   const lifecycle = ctx.runtime.getLifecycle();
-  const installedHere =
-    owner.scope === "workspace"
-      ? lifecycle.getInstance(serverName, owner.wsId) != null
-      : (lifecycle.getUserInstance?.(serverName, owner.userId) ?? null) != null;
+  const installedHere = lifecycle.getInstance(serverName, owner.wsId) != null;
   if (!installedHere) {
-    return errResult(`Connector "${serverName}" is not installed in ${owner.scope} scope.`);
+    return errResult(`Connector "${serverName}" is not installed in workspace "${owner.wsId}".`);
   }
 
   const tools: Record<string, "allow" | "disallow"> = {};

@@ -161,7 +161,18 @@ export async function createSystemTools(
 
         // scope === "tools" (default)
         const q = query.toLowerCase();
-        const all = (await getRegistry().availableTools()).filter(
+        // Identity-level discovery: search the identity's full
+        // cross-workspace tool union (the aggregator), not just the
+        // calling workspace. The aggregator namespaces nb__search per
+        // workspace, so the model may invoke any workspace's copy — all
+        // must see everything the identity can reach, else a tool
+        // installed in another workspace (e.g. a CRM in ws_mat) is
+        // invisible to this copy. Falls back to the current workspace
+        // when there's no identity in scope (non-identity-bound paths).
+        const discoverable = runtime
+          ? await runtime.listDiscoverableTools()
+          : await getRegistry().availableTools();
+        const all = discoverable.filter(
           (t) =>
             toolEligibilityCtx?.isToolEligible(t) ?? !t.annotations?.["ai.nimblebrain/internal"],
         );
@@ -272,10 +283,10 @@ export async function createSystemTools(
     systemToolDefs.push(createManageWorkspacesTool(mergedCtx));
   }
 
-  // Connectors tool. Surface includes both workspace-scope and
-  // user-scope (personal) connectors under one tool action surface —
-  // the right scope is chosen by the catalog entry's `defaultScope` for
-  // installs and by lookup for disconnects.
+  // Connectors tool. Single surface for both workspace-targeted and
+  // personal-workspace-targeted connectors — the install destination
+  // is chosen by the catalog entry's `defaultBinding`, and disconnects
+  // look up the binding workspace from the installed ref.
   if (runtime && manageWorkspacesCtx) {
     systemToolDefs.push(
       createManageConnectorsTool({

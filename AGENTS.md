@@ -136,7 +136,30 @@ All tool handlers that access data must be workspace-scoped. Use `runtime.requir
 
 When adding a new code path that touches workspace-scoped credentials or identity, match the existing precedent: **hard-error on missing `wsId`, don't silently default**. `startBundleSource`'s named-bundle branch throws; the URL-bundle branch does too (for OAuth-provider paths). A `?? "ws_default"` fallback would pool credentials across tenants.
 
+**Credentials live in the workspace, not the user.** Post-Stage-2 every credential file is reachable at `{workDir}/workspaces/<wsId>/credentials/...` and is constructed only through `WorkspaceContext` (via `runtime.getWorkspaceContext(wsId)`) or the primitives in `src/config/workspace-credentials.ts`. The pre-Stage-2 layout `{workDir}/users/<userId>/credentials/...` is fully deleted from the read path — the loader at `src/bundles/lifecycle.ts::assertBundleRefIsPostStage2` throws `LegacyOAuthScopeError` on any disk record carrying `oauthScope: "user"`, and operators must run `bun run migrate:user-creds` before deploying (see the Stage 2 deploy runbook). User-personal credentials live in the user's personal workspace at `{workDir}/workspaces/ws_user_<userId>/credentials/...` — the same code path serves them. `users/<userId>/...` is reserved for non-credential per-user data (currently `users/<userId>/skills/`); future per-user data follows the same convention. Hand-building `join(workDir, "users", userId, "credentials", ...)` paths is a regression caught by `check:credential-paths`.
+
 **Conversations are user-scoped, not workspace-scoped.** Post-Stage-1, every conversation lives at `{workDir}/conversations/{convId}.jsonl` and is authorized by ownership (`Conversation.ownerId === access.userId`). Look up via `runtime.findConversation(convId, { userId })`; write via `runtime.findConversationStore()`. `workspaceId` on conversation metadata is a tool-scoping breadcrumb — it tells the runtime which workspace's tools the chat had access to when a turn ran, NOT where the file lives. Hand-building per-workspace conversation paths (`join(workDir, "workspaces", wsId, "conversations", ...)`) is a regression caught by `check:conversation-paths`. **Personal workspace ids** go through `personalWorkspaceIdFor(userId)` from `src/workspace/workspace-store.ts` — no hand-built `"ws_user_" + userId` or `` `ws_user_${userId}` `` outside that helper (`check:personal-workspace-id` enforces).
+
+### Cross-workspace tool namespacing (Stage 2)
+
+Sessions — chat and `/mcp` — are **identity-bound, not workspace-bound**. A user's tool list aggregates across every workspace they belong to. **What ships today: every tool is namespaced per workspace** as `ws_<id>-<source>__<tool>` — the aggregator namespaces *all* sources in each per-workspace registry, including the platform `nb` source (so `nb__search` surfaces as `ws_<id>-nb__search`, never bare). `ws_helix-crm__search` and `ws_user_<id>-conversations__search` can be invoked in the same conversation.
+
+The name *grammar* also recognizes a **bare/global scope** (a name with no `ws_<id>-` prefix parses to `{ kind: "global" }`), intended for platform + identity-owned singletons. **Global dispatch is not yet wired** — `routeToolCall` fail-closes a bare name with `GlobalScopeNotRoutable`, deferred to a later stage. Until then, treat every shipped tool name as workspace-namespaced; a bare name is a client error, not a valid call.
+
+- **Construct** workspace names only via `namespacedToolName(wsId, name)` from `src/tools/namespace.ts`. **Parse** only via `parseNamespacedToolName(s)` (returns `{ scope, toolName }`; a name with no `ws_<id>-` prefix is `scope: global`). Hand-building or hand-parsing a namespaced name is a regression caught by `check:tool-namespace`.
+- **Web tier** mirrors the parser at `web/src/lib/namespaced-tool.ts` (web can't import from `src/`). The web parser's regex is built from `WORKSPACE_ID_PATTERN` / `WORKSPACE_ID_FLAGS` in `web/src/_generated/workspace-id-pattern.ts`, emitted from `src/workspace/workspace-id-pattern.ts` by `bun run codegen`. `check:codegen` catches drift; a regex-equality test in `web/test/namespaced-tool.test.ts` pins the contract.
+- **Per-call routing** lives in `src/orchestrator/` — parse `ws_<id>-<name>` → construct `WorkspaceContext(id)` → dispatch. Errors flow as `UnknownNamespacedToolName` / `UnknownWorkspace` / `WorkspaceAccessDenied` / `UnknownToolSource` / `GlobalScopeNotRoutable` (bare/global names, until global dispatch lands); both the chat REST surface (`POST /v1/chat`) and the `/mcp` JSON-RPC surface map them to identical structured `data.reason` discriminators.
+- `BundleRef.oauthScope: "user"` is **deleted from the type union** (Stage 2 / T008). Every install binds workspace explicitly via `wsId`; legacy disk records throw `LegacyOAuthScopeError` on load with an operator-actionable message naming the migration script.
+- **Dev-mode parity.** Identity-bound sessions work in dev mode (no auth gate); the dev identity flows through the orchestrator the same as a real one. `runtime.requireWorkspaceId()` returns `"_dev"` only when no workspace is in scope — cross-workspace dispatch routes through the same code path.
+
+### Stage 2 follow-ups — tenant migration order
+
+When migrating a tenant onto Stage 2, run the user-credential migration during a maintenance window with the platform scaled to zero:
+
+1. `bun run migrate:user-creds` — moves `{workDir}/users/<userId>/credentials/...` to `{workDir}/workspaces/ws_user_<userId>/credentials/...`. Idempotent, dry-run by default, shares `.migration-lock` with the Stage 1 scripts. Run **before** deploying the Stage 2 image — the loader throws `LegacyOAuthScopeError` on first read of any unmigrated `oauthScope: "user"` record.
+2. Cut traffic to the new build. The first `/mcp` session after the cut allocates an identity-bound session id; the Redis registry schema dropped `workspaceId` (Q4 hard cut) so any in-flight session is harmless to drain.
+
+The full runbook (verification checks, rollback, smoke tests) lives in the Stage 2 deploy runbook.
 
 ### Stage 1 follow-ups — tenant migration order
 
@@ -342,7 +365,7 @@ These cause production bugs if violated:
 - Bridge must guard listeners with `destroyed` flag (React StrictMode double-mounts)
 - `SlotRenderer` effect depends only on `placementKey` (callbacks via refs, not deps)
 - Shell components must not consume `ChatContext` (use `ChatConfigContext` instead)
-- `setAuthToken` and `setActiveWorkspaceId` in `web/src/api/client.ts` fire a registered lifecycle handler on real changes only (equality-guarded). The bridge MCP client registers `resetMcpBridgeClient` here at module load to drop its workspace-bound session on switch / logout. Stateless callers (REST helpers) read the current values per-request and need no hook.
+- `setAuthToken` in `web/src/api/client.ts` fires a registered lifecycle handler on real changes only (equality-guarded). The bridge MCP client registers `resetMcpBridgeClient` here at module load to drop its identity-bound session on logout. `setActiveWorkspaceId` is also equality-guarded but does NOT fire the handler — per Stage 2 / Q3 the `/mcp` session is identity-bound, so workspace switches reuse the same session and dispatch context via the per-request `X-Workspace-Id` header. Stateless callers (REST helpers) read the current values per-request and need no hook.
 
 ## Auto-Generated Files
 

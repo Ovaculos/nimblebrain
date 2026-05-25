@@ -14,6 +14,16 @@ export interface WorkspaceInfo {
   bundles: Array<{ name?: string; path?: string }>;
   /** The signed-in user's role within this workspace, when they're a member. */
   userRole?: "admin" | "member";
+  /**
+   * `true` for the user's personal workspace (auto-provisioned at first
+   * login, sole-owner-by-design). Drives the install dialog's preselection
+   * heuristic — personal-typical connectors (`defaultBinding: "personal"`)
+   * default to the personal workspace; non-personal workspaces require an
+   * explicit pick. The platform's bootstrap endpoint sets this; the
+   * `parseWorkspaceListResponse` fallback also propagates it so the
+   * shell mounted via either path agrees.
+   */
+  isPersonal?: boolean;
 }
 
 interface WorkspaceContextValue {
@@ -63,7 +73,21 @@ export function WorkspaceProvider({
       const active = initialActiveId
         ? (initialWorkspaces.find((w) => w.id === initialActiveId) ?? initialWorkspaces[0])
         : initialWorkspaces[0];
-      if (active) setActiveWorkspaceId(active.id);
+      if (active) {
+        setActiveWorkspaceId(active.id);
+        // Defense-in-depth: localStorage may hold a stale workspace id
+        // (e.g. a workspace the user was removed from, or one that was
+        // deleted). The in-memory api/client state now reflects the
+        // server-resolved fallback; keep localStorage in lockstep so
+        // any code reading it directly doesn't get the stale value.
+        try {
+          if (localStorage.getItem(STORAGE_KEY) !== active.id) {
+            localStorage.setItem(STORAGE_KEY, active.id);
+          }
+        } catch {
+          // localStorage may be unavailable (private mode, quota)
+        }
+      }
       return active ?? null;
     }
     return null;

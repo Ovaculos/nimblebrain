@@ -13,6 +13,7 @@ import { getProviderFromModel, supportsEnabledThinking } from "../model/catalog.
 import { normalizeForReplay } from "../model/inbound-fit.ts";
 import { callModel, type StreamResult } from "../model/stream.ts";
 import { coerceInputForSchema } from "../tools/coerce-input.ts";
+import { bareToolName } from "../tools/namespace.ts";
 import { validateToolInput } from "../tools/validate-input.ts";
 import type { TokenUsage } from "../usage/types.ts";
 import { addUsage, emptyUsage } from "../usage/types.ts";
@@ -372,7 +373,10 @@ export class AgentEngine {
         };
       },
       removeTool: (toolName: string) => {
-        if (toolName.startsWith("nb__")) {
+        // Match the BARE name: Stage 2 surfaces system tools as
+        // `ws_<id>-nb__<tool>`, so a raw `startsWith("nb__")` would let a
+        // namespaced system tool be released.
+        if (bareToolName(toolName).startsWith("nb__")) {
           return {
             ok: false,
             toolName,
@@ -775,11 +779,10 @@ export class AgentEngine {
               try {
                 // Forward the run's AbortSignal so task-augmented MCP tools
                 // propagate cancellation via tasks/cancel and inline tools
-                // abort their in-flight RPC. principalId is the conversation
-                // owner's id — used by member-scoped MCP bundles to route
-                // to the right per-principal source. Workspace-scoped
-                // sources ignore it.
-                result = await this.tools.execute(gatedCall, config.signal, config.principalId);
+                // abort their in-flight RPC. Identity flows through
+                // AsyncLocalStorage (`runWithRequestContext`); no principal
+                // argument threads through the call.
+                result = await this.tools.execute(gatedCall, config.signal);
               } catch (err) {
                 result = {
                   content: textContent(err instanceof Error ? err.message : String(err)),

@@ -105,7 +105,7 @@ function gmailEntry(): import("../../src/registries/types.ts").DirectoryEntry {
     registryType: "static",
     name: "Gmail",
     description: "Read, send, and draft mail",
-    defaultScope: "workspace",
+    defaultBinding: "workspace",
     install: {
       kind: "remote-oauth",
       url: GMAIL_URL,
@@ -173,7 +173,6 @@ function buildHarness(): Harness {
     getEventSink: () => new NoopEventSink(),
     getPermissionStore: () => ({ deleteConnector: async () => {} }),
     getUserStore: () => ({ get: async () => null }),
-    getUserConnectorStore: () => ({ get: async () => null }),
     getBundleInstancesForWorkspace: () => lifecycle.getInstances(),
   } as unknown as Runtime;
 
@@ -239,7 +238,7 @@ describe("manage_connectors.install (composio-auth)", () => {
     Extract<BundleRef, { url: string }> | undefined
   > {
     const tool = buildTool(h);
-    await tool.handler({ action: "install", entry: gmailEntry() });
+    await tool.handler({ action: "install", entry: gmailEntry(), wsId: h.wsId });
     const ws = await h.workspaceStore.get(h.wsId);
     return ws?.bundles.find(
       (b): b is Extract<BundleRef, { url: string }> => "url" in b && "composio" in b,
@@ -319,7 +318,7 @@ describe("manage_connectors.install (composio-auth)", () => {
     process.env.COMPOSIO_GMAIL_AUTH_CONFIG_ID = "ac_gmail";
 
     const tool = buildTool(h);
-    const result = await tool.handler({ action: "install", entry: gmailEntry() });
+    const result = await tool.handler({ action: "install", entry: gmailEntry(), wsId: h.wsId });
 
     // Eager-start fails on the fake `composio.test` URL, but the
     // install itself has succeeded — the BundleRef is in workspace.json,
@@ -357,7 +356,7 @@ describe("manage_connectors.install (composio-auth)", () => {
     process.env.COMPOSIO_GMAIL_AUTH_CONFIG_ID = "ac_gmail";
 
     const tool = buildTool(h);
-    const result = await tool.handler({ action: "install", entry: gmailEntry() });
+    const result = await tool.handler({ action: "install", entry: gmailEntry(), wsId: h.wsId });
 
     expect(result.isError).toBe(true);
     const text = (result.content?.[0] as { text?: string } | undefined)?.text ?? "";
@@ -374,7 +373,7 @@ describe("manage_connectors.install (composio-auth)", () => {
     // COMPOSIO_GMAIL_AUTH_CONFIG_ID intentionally missing.
 
     const tool = buildTool(h);
-    const result = await tool.handler({ action: "install", entry: gmailEntry() });
+    const result = await tool.handler({ action: "install", entry: gmailEntry(), wsId: h.wsId });
 
     expect(result.isError).toBe(true);
     const text = (result.content?.[0] as { text?: string } | undefined)?.text ?? "";
@@ -397,7 +396,7 @@ describe("manage_connectors.install (composio-auth)", () => {
     }
 
     const tool = buildTool(h);
-    const result = await tool.handler({ action: "install", entry: malformed });
+    const result = await tool.handler({ action: "install", entry: malformed, wsId: h.wsId });
 
     expect(result.isError).toBe(true);
     const text = (result.content?.[0] as { text?: string } | undefined)?.text ?? "";
@@ -434,7 +433,7 @@ describe("manage_connectors.install (composio-auth)", () => {
     };
 
     const tool = buildTool(h);
-    const result = await tool.handler({ action: "install", entry: gmailEntry() });
+    const result = await tool.handler({ action: "install", entry: gmailEntry(), wsId: h.wsId });
 
     expect(result.isError).toBe(false);
     const sc = result.structuredContent as {
@@ -473,7 +472,7 @@ describe("manage_connectors.install (composio-auth)", () => {
     };
 
     const tool = buildTool(h);
-    const result = await tool.handler({ action: "install", entry: gmailEntry() });
+    const result = await tool.handler({ action: "install", entry: gmailEntry(), wsId: h.wsId });
 
     expect(result.isError).toBe(true);
     const text = (result.content?.[0] as { text?: string } | undefined)?.text ?? "";

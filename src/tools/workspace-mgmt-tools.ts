@@ -41,7 +41,7 @@ export function createManageWorkspacesTool(ctx: ManageWorkspacesContext): InProc
   return {
     name: "manage_workspaces",
     description:
-      "Manage workspaces and their members. Workspace CRUD requires org admin. Member management requires workspace or org admin. Conversation sharing was removed in Stage 1 of the delegation-model refactor and returns in Stage 4 with policy-gated primitives.",
+      "Manage workspaces and their members. Workspace CRUD requires org admin. Member management requires workspace or org admin. Conversation sharing was removed in Stage 1 of the cross-workspace refactor and returns in Stage 4 with policy-gated primitives.",
     inputSchema: {
       type: "object",
       properties: {
@@ -324,6 +324,11 @@ async function handleList(ctx: ManageWorkspacesContext): Promise<ToolResult> {
         // web client gate workspace-admin UI without an extra `list_members`
         // round-trip per workspace.
         ...(userRole ? { userRole } : {}),
+        // `isPersonal` is consumed by T010's WorkspaceTargetPicker to
+        // preselect the personal workspace for personal-typical
+        // connectors. Pre-Stage-1 workspaces return `false`; the
+        // picker degrades to "no preselection" gracefully.
+        isPersonal: ws.isPersonal === true,
       };
     });
     const data = { workspaces: result };
