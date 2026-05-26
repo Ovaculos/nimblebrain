@@ -13,12 +13,17 @@ import {
   ConversationCorruptedError,
   RunInProgressError,
 } from "../runtime/errors.ts";
-import { type RequestContext, runWithRequestContext } from "../runtime/request-context.ts";
+import {
+  type RequestContext,
+  type RequestScope,
+  runWithRequestContext,
+} from "../runtime/request-context.ts";
 import type { Runtime } from "../runtime/runtime.ts";
 import type { ChatRequest } from "../runtime/types.ts";
 import { coerceInputForSchema } from "../tools/coerce-input.ts";
 import type { HealthMonitor } from "../tools/health-monitor.ts";
-import type { ResourceData } from "../tools/types.ts";
+import type { ToolRegistry } from "../tools/registry.ts";
+import type { ResourceData, ToolSource } from "../tools/types.ts";
 import { validateToolInput } from "../tools/validate-input.ts";
 import { estimateCost } from "../usage/cost.ts";
 import { bytesToBase64 } from "../util/base64.ts";
@@ -474,20 +479,8 @@ export async function handleResourceProxy(
   runtime: Runtime,
   workspaceId?: string,
 ): Promise<Response> {
-  // Workspace authorization — reject requests for servers not in the active workspace
-  if (workspaceId) {
-    const wsRegistry = await runtime.ensureWorkspaceRegistry(workspaceId);
-    if (!wsRegistry.hasSource(appName)) {
-      return apiError(
-        403,
-        "workspace_access_denied",
-        `App "${appName}" is not available in this workspace`,
-        { app: appName },
-      );
-    }
-  }
-
-  // Dev mode: redirect to local Vite dev server when --app flag is active
+  // Dev mode: redirect to local Vite dev server when --app flag is active.
+  // Applies to both identity and workspace apps, so it runs first.
   const { isDevMode, getAppDevUrl } = await import("../runtime/dev-registry.ts");
   if (isDevMode(appName)) {
     const devUrl = getAppDevUrl(appName)!;
@@ -495,12 +488,46 @@ export async function handleResourceProxy(
     return Response.redirect(`${devUrl}${target}`, 302);
   }
 
-  // Both platform built-ins and user-installed bundles are now MCP servers
-  // (in-process or subprocess); both go through the same `readAppResource`
-  // path. The only branch is for "primary" → resourceUri resolution, which
-  // platform sources expose via the source's mode metadata while external
-  // bundles expose via their `instance.ui.placements`.
-  if (!workspaceId) throw new Error("Workspace ID required");
+  // Identity apps (conversations, …) live OUTSIDE any workspace. They are
+  // authorized by the authenticated session (requireAuth already ran on this
+  // route) and read from the kernel identity source — never a workspace
+  // registry. A stale `X-Workspace-Id` (the last active workspace the shell
+  // sent) is ignored: location is scope, and an identity app has no workspace
+  // location to authorize against.
+  const identitySource = runtime.getIdentitySource(appName);
+  if (identitySource) {
+    let resolvedPath = resourcePath;
+    if (resourcePath === "primary") {
+      const primaryUri = resolveSourcePrimaryResourceUri(identitySource);
+      if (primaryUri) resolvedPath = primaryUri.replace(/^ui:\/\//, "");
+    }
+    const resource = await runtime.readIdentityAppResource(appName, resolvedPath);
+    if (resource === null) {
+      return apiError(404, "resource_not_found", `Resource "ui://${resourcePath}" not found`, {
+        resource: `ui://${resourcePath}`,
+      });
+    }
+    return json({ contents: [buildResourceEnvelopeEntry(`ui://${resolvedPath}`, resource)] });
+  }
+
+  // Workspace apps — require a workspace and authorize membership. Both
+  // platform built-ins and user-installed bundles are MCP servers reachable
+  // through the workspace registry; registry membership is the authoritative
+  // "is this app available to this workspace?" check.
+  if (!workspaceId) {
+    return apiError(400, "workspace_required", `App "${appName}" requires a workspace`, {
+      app: appName,
+    });
+  }
+  const wsRegistry = await runtime.ensureWorkspaceRegistry(workspaceId);
+  if (!wsRegistry.hasSource(appName)) {
+    return apiError(
+      403,
+      "workspace_access_denied",
+      `App "${appName}" is not available in this workspace`,
+      { app: appName },
+    );
+  }
 
   let resolvedPath = resourcePath;
   if (resourcePath === "primary") {
@@ -550,8 +577,19 @@ async function resolvePrimaryResourceUri(
 
   const registry = await runtime.ensureWorkspaceRegistry(workspaceId);
   const source = registry.getSources().find((s) => s.name === appName);
-  if (!source) return null;
-  const fn = (source as { getPlacements?: () => unknown }).getPlacements;
+  return resolveSourcePrimaryResourceUri(source);
+}
+
+/**
+ * Resolve a source's "primary" `resourceUri` by scanning the placements it
+ * declares via `getPlacements()` (the in-process `McpSource` duck-type). Used
+ * directly by the identity-app host (no workspace, no lifecycle instance) and
+ * as the fallback tier of {@link resolvePrimaryResourceUri} for workspace
+ * apps. Returns `null` when the source declares no placement with a
+ * `resourceUri`.
+ */
+function resolveSourcePrimaryResourceUri(source: unknown): string | null {
+  const fn = (source as { getPlacements?: () => unknown } | undefined)?.getPlacements;
   if (typeof fn !== "function") return null;
   const placements = fn.call(source);
   if (!Array.isArray(placements)) return null;
@@ -640,9 +678,7 @@ export async function handleReadResource(
   // catches the exception, returning null → 404 to the caller.
   const reqCtx: RequestContext = {
     identity: null,
-    workspaceId,
-    workspaceAgents: null,
-    workspaceModelOverride: null,
+    scope: { kind: "workspace", workspaceId, workspaceAgents: null, workspaceModelOverride: null },
   };
   const resource = await runWithRequestContext(reqCtx, () =>
     runtime.readAppResource(server, uri, workspaceId),
@@ -688,29 +724,48 @@ export async function handleToolCall(
 
   const { sseManager, eventSink, identity, workspaceId } = options ?? {};
 
-  // Resolve registry: workspace-scoped when available, global otherwise
-  if (!workspaceId) throw new Error("Workspace ID required");
-  const registry = await runtime.ensureWorkspaceRegistry(workspaceId);
-
-  // Check if server exists
-  if (!registry.hasSource(server)) {
-    return apiError(404, "tool_not_found", `Tool "${tool}" not found on server "${server}"`, {
-      server,
-      tool,
-    });
+  // Resolve the source through the two doors — the same decision the
+  // orchestrator makes for `/mcp` (`routeToolCall`). Identity sources
+  // (conversations, …) are owned by the user and live OUTSIDE any workspace:
+  // they resolve from the identity-source set and dispatch with identity
+  // scope, regardless of any (stale) X-Workspace-Id. Everything else resolves
+  // through the workspace registry and keeps its per-workspace permission
+  // gating on execute. Without this, a REST call to an identity source 404s
+  // ("not found on server") because the workspace registry no longer holds it.
+  const identitySource = runtime.getIdentitySource(server);
+  let workspaceRegistry: ToolRegistry | undefined;
+  let source: ToolSource | undefined;
+  let scope: RequestScope;
+  if (identitySource) {
+    source = identitySource;
+    scope = { kind: "identity" };
+  } else {
+    if (!workspaceId) {
+      return apiError(400, "workspace_required", `Tool "${tool}" requires a workspace`, {
+        server,
+        tool,
+      });
+    }
+    workspaceRegistry = await runtime.ensureWorkspaceRegistry(workspaceId);
+    if (!workspaceRegistry.hasSource(server)) {
+      return apiError(404, "tool_not_found", `Tool "${tool}" not found on server "${server}"`, {
+        server,
+        tool,
+      });
+    }
+    source = workspaceRegistry.getSources().find((s) => s.name === server);
+    scope = { kind: "workspace", workspaceId, workspaceAgents: null, workspaceModelOverride: null };
   }
 
-  // Check if tool exists on the server
-  // The tool name may already be prefixed (e.g., "home__briefing" from the bridge)
-  // or bare (e.g., "briefing"). Normalize to full name.
+  // The tool name may already be prefixed (e.g., "home__briefing" from the
+  // bridge) or bare (e.g., "briefing"). Normalize to the full name.
   const toolName = tool.startsWith(`${server}__`) ? tool : `${server}__${tool}`;
 
-  // Coerced args flow through to registry.execute below — validation and
-  // execution must see the same shape. Defaults to the raw args; replaced
-  // with the schema-coerced version once we resolve the tool definition.
+  // Coerced args flow through to execute below — validation and execution must
+  // see the same shape. Defaults to the raw args; replaced with the
+  // schema-coerced version once we resolve the tool definition.
   let coercedArgs: Record<string, unknown> = args ?? {};
 
-  const source = registry.getSources().find((s) => s.name === server);
   if (source) {
     try {
       const tools = await source.tools();
@@ -759,12 +814,12 @@ export async function handleToolCall(
     });
   }
 
-  // Build per-request context for AsyncLocalStorage (concurrency-safe)
+  // Build per-request context for AsyncLocalStorage (concurrency-safe). The
+  // scope is the resolved door — identity for a kernel identity source,
+  // workspace otherwise — never a nullable workspace.
   const reqCtx: RequestContext = {
     identity: identity ?? null,
-    workspaceId: workspaceId ?? null,
-    workspaceAgents: null,
-    workspaceModelOverride: null,
+    scope,
   };
 
   // Audit log
@@ -779,24 +834,32 @@ export async function handleToolCall(
       id: callId,
       server,
       userId: identity?.id ?? null,
-      workspaceId: workspaceId ?? null,
+      workspaceId: scope.kind === "workspace" ? scope.workspaceId : null,
     },
   };
   sseManager?.emit(bridgeCallEvent);
   eventSink?.emit(bridgeCallEvent);
 
   const t0 = performance.now();
-  let result: Awaited<ReturnType<typeof registry.execute>> | undefined;
+  let result: Awaited<ReturnType<ToolRegistry["execute"]>> | undefined;
   try {
     // Identity flows through AsyncLocalStorage via `reqCtx`. Sources that
     // need the caller's identity read it from `getRequestContext()`.
-    result = await runWithRequestContext(reqCtx, () =>
-      registry.execute({
-        id: callId,
-        name: toolName,
-        input: coercedArgs,
-      }),
-    );
+    //
+    // Workspace tools dispatch through the registry (which applies the
+    // per-workspace permission gating wired via `setPermissionContext`).
+    // Identity tools have no workspace registry — dispatch straight to the
+    // source with the bare tool name (owner-gated in the handler), mirroring
+    // the `/mcp` identity branch.
+    result = await runWithRequestContext(reqCtx, () => {
+      if (identitySource) {
+        return identitySource.execute(toolName.slice(toolName.indexOf("__") + 2), coercedArgs);
+      }
+      // A non-identity source always resolved a workspace registry above (or
+      // we 400'd); the guard narrows the type without a non-null assertion.
+      if (!workspaceRegistry) throw new Error("workspace registry missing for workspace tool");
+      return workspaceRegistry.execute({ id: callId, name: toolName, input: coercedArgs });
+    });
   } catch (err) {
     const ms = Math.round(performance.now() - t0);
     const failEvent = {
@@ -807,7 +870,7 @@ export async function handleToolCall(
         ok: false,
         ms,
         userId: identity?.id ?? null,
-        workspaceId: workspaceId ?? null,
+        workspaceId: scope.kind === "workspace" ? scope.workspaceId : null,
       },
     };
     sseManager?.emit(failEvent);
@@ -856,7 +919,7 @@ export async function handleToolCall(
       ok: !result.isError,
       ms,
       userId: identity?.id ?? null,
-      workspaceId: workspaceId ?? null,
+      workspaceId: scope.kind === "workspace" ? scope.workspaceId : null,
     },
   };
   sseManager?.emit(doneEvent);

@@ -194,6 +194,22 @@ describe("/mcp identity-bound session (Stage 2 T007)", () => {
     }
   });
 
+  it("identity sources surface BARE in tools/list, never ws-prefixed (one door)", async () => {
+    // `conversations` is a kernel identity source: emitted bare
+    // (`conversations__list`) and NOT composed into any workspace registry, so
+    // it never appears as `ws_<id>-conversations__*`. This is the one-door
+    // guarantee at the list level — the chat reaches conversations through the
+    // identity door only, never the workspace door.
+    const client = await createIdentityBoundClient();
+    try {
+      const names = (await client.listTools()).tools.map((t) => t.name);
+      expect(names).toContain("conversations__list");
+      expect(names.some((n) => n.startsWith("ws_") && n.includes("conversations__"))).toBe(false);
+    } finally {
+      await client.close();
+    }
+  });
+
   it("cross-workspace calls in one session route to distinct sources (failure mode: dispatch-to-current-workspace)", async () => {
     sharedSource.reset();
     personalSource.reset();
@@ -343,16 +359,16 @@ describe("/mcp identity-bound session (Stage 2 T007)", () => {
     }
   });
 
-  it("tools/call with a bare name rejects with -32602 (bare → global scope, not silently routed to a workspace)", async () => {
+  it("tools/call with a bare name rejects with -32602 (bare → identity scope, not silently routed to a workspace)", async () => {
     const client = await createIdentityBoundClient();
     try {
       let errorCode: number | undefined;
       let dataReason: string | undefined;
       let errorMessage: string | undefined;
       try {
-        // A bare `<source>__<tool>` for a workspace app. Bare = global
-        // scope; a workspace-app tool isn't a global tool, so it's refused
-        // (pre-W3 as "global not routable") — NOT silently routed to a
+        // A bare `<source>__<tool>` for a workspace app. Bare = identity
+        // scope; a workspace-app source isn't a kernel identity source, so
+        // it's refused (UnknownIdentitySource) — NOT silently routed to a
         // current workspace.
         await client.callTool({
           name: `${SHARED_SOURCE_NAME}__${SHARED_TOOL_BARE}`,
@@ -365,8 +381,25 @@ describe("/mcp identity-bound session (Stage 2 T007)", () => {
         errorMessage = e.message;
       }
       expect(errorCode).toBe(-32602);
-      expect(dataReason).toBe("global_not_routable");
-      expect(errorMessage).toContain("Global tool dispatch");
+      expect(dataReason).toBe("unknown_identity_source");
+      expect(errorMessage).toContain("No identity source");
+    } finally {
+      await client.close();
+    }
+  });
+
+  it("tools/call with a bare IDENTITY-source name dispatches through the identity door (failure mode: identity tool unreachable)", async () => {
+    // The happy-path counterpart to the rejection above. `conversations` IS a
+    // kernel identity source, so a bare `conversations__list` — no
+    // `X-Workspace-Id`, no `ws_` prefix — routes through the identity door and
+    // executes against the caller's identity. This is the exact wire call the
+    // conversations iframe makes; a fresh workdir yields an empty (but
+    // successful) result, proving the door is open, not just that bare names
+    // parse.
+    const client = await createIdentityBoundClient();
+    try {
+      const result = await client.callTool({ name: "conversations__list", arguments: {} });
+      expect(result.isError).toBeFalsy();
     } finally {
       await client.close();
     }

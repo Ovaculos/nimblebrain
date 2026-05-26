@@ -37,9 +37,9 @@ const WORKSPACE_ID_RE = new RegExp(WORKSPACE_ID_PATTERN, WORKSPACE_ID_FLAGS);
 
 /**
  * The scope a tool name dispatches into. Mirrors `ToolScope` in
- * `src/tools/namespace.ts`: a workspace (`ws_<id>-`) or global (bare).
+ * `src/tools/namespace.ts`: a workspace (`ws_<id>-`) or identity (bare).
  */
-export type ToolScope = { kind: "workspace"; wsId: string } | { kind: "global" };
+export type ToolScope = { kind: "workspace"; wsId: string } | { kind: "identity" };
 
 /**
  * Parse a tool name into `{ scope, toolName }`. Returns `null` only for
@@ -47,7 +47,7 @@ export type ToolScope = { kind: "workspace"; wsId: string } | { kind: "global" }
  * the raw input in that case (Q2: "fall back to raw if metadata missing").
  *
  * Grammar mirrors the platform primitive: `ws_<id>-<toolName>` → workspace
- * (toolName is the remainder); a **bare** name → `{ kind: "global" }` with
+ * (toolName is the remainder); a **bare** name → `{ kind: "identity" }` with
  * toolName = the whole input (no prefix to strip). The web parser returns
  * null instead of throwing so a transcript renderer degrades gracefully.
  */
@@ -64,8 +64,8 @@ export function parseNamespacedToolName(s: string): { scope: ToolScope; toolName
     // Looks like a workspace attempt but the id is malformed → render raw.
     if (head.startsWith("ws_")) return null;
   }
-  // Bare: the whole name is the global tool name.
-  return { scope: { kind: "global" }, toolName: s };
+  // Bare: the whole name is the identity tool name (no prefix to strip).
+  return { scope: { kind: "identity" }, toolName: s };
 }
 
 /**
@@ -90,5 +90,5 @@ export function namespacedToolName(wsId: string, toolName: string): string {
   return `${wsId}-${toolName}`;
 }
 
-// Global tools have no builder: a global tool's wire name IS its bare
-// `<source>__<tool>` form. Absence of a `ws_<id>-` prefix makes it global.
+// Identity tools have no builder: an identity tool's wire name IS its bare
+// `<source>__<tool>` form. Absence of a `ws_<id>-` prefix makes it identity-scoped.

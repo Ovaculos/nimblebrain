@@ -4,6 +4,7 @@ import { NavLink } from "react-router-dom";
 import { useChatPanelContext } from "../context/ChatPanelContext";
 import { useSidebar } from "../context/SidebarContext";
 import { useWorkspaceContext } from "../context/WorkspaceContext";
+import { identityAppRoute, isIdentityApp } from "../lib/identity-apps";
 import { resolveIcon } from "../lib/icons";
 import { cn } from "../lib/utils";
 import { toSlug } from "../lib/workspace-slug";
@@ -126,8 +127,14 @@ export const ShellLayout = memo(function ShellLayout({
               session). Hidden when the sidebar is collapsed to icon-only. */}
           {!isCollapsed && <SidebarSearch />}
 
-          {/* Scrolling region — key triggers fade-in on workspace switch */}
-          <div key={wsSlug} className="flex-1 overflow-y-auto py-1 sidebar-scroll sidebar-nav-fade">
+          {/* Scrolling region. The nav is identity-level — the same Home /
+              Conversations / Automations / Files + workspaces list regardless
+              of which workspace is active — so it must NOT remount on a
+              workspace switch (no `key={wsSlug}`). Switching just re-renders the
+              active highlight + the workspace-routed hrefs in place; remounting
+              made the whole left nav visibly flash on every switch. The
+              fade-in runs once, on initial mount. */}
+          <div className="flex-1 overflow-y-auto py-1 sidebar-scroll sidebar-nav-fade">
             {/* Core nav (Home, Conversations, Automations, Files) —
                 global, identity-bound. Siblings of workspaces. */}
             {ungrouped.map((p) => (
@@ -251,6 +258,10 @@ function resolveRoute(p: PlacementEntry, wsSlug?: string): string {
   // workspace overview lives at `/w/<slug>/` and is reached by clicking
   // the workspace row directly.
   if (p.route === "/") return "/";
+  // Identity apps (conversations, …) are owned by the user and live OUTSIDE
+  // any workspace — they render at a top-level root route (e.g.
+  // `/conversations`), never under `/w/<slug>`. Location is scope.
+  if (isIdentityApp(p.serverName)) return identityAppRoute(p.serverName);
   // Other routed placements get /w/<slug>/app/<route>
   const prefix = wsSlug ? `/w/${wsSlug}` : "";
   if (p.route) return `${prefix}/app/${p.route}`;
