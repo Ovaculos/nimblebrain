@@ -811,6 +811,55 @@ export async function uninstallConnector(
 }
 
 /**
+ * One installed registry app, aggregated org-wide (deduped by bundle name).
+ * App version is org-global because the mpak cache is shared platform-wide —
+ * see `src/tools/app-tools.ts`.
+ */
+export interface OrgApp {
+  bundleName: string;
+  version: string;
+  trustScore: number | null;
+  workspaceCount: number;
+  workspaceIds: string[];
+}
+
+/** One available app update. */
+export interface AppUpdate {
+  bundleName: string;
+  current: string;
+  latest: string;
+}
+
+/** List installed registry apps across the org (org_admin). */
+export async function listApps(): Promise<{ apps: OrgApp[] }> {
+  const result = await callTool("nb", "manage_apps", { action: "list" });
+  return unwrapStructured(result, "list");
+}
+
+/** Check the registry for newer app versions across the org (org_admin). */
+export async function checkAppUpdates(): Promise<{ updates: AppUpdate[] }> {
+  const result = await callTool("nb", "manage_apps", { action: "check_updates" });
+  return unwrapStructured(result, "check_updates");
+}
+
+/**
+ * Upgrade an app to its latest version across every workspace that has it
+ * (org_admin). `upgraded` is false when already at latest; `workspaces` reports
+ * per-workspace success.
+ */
+export async function upgradeApp(bundleName: string): Promise<{
+  ok: boolean;
+  upgraded: boolean;
+  bundleName: string;
+  from: string;
+  to: string;
+  workspaces: Array<{ wsId: string; ok: boolean; error?: string }>;
+}> {
+  const result = await callTool("nb", "manage_apps", { action: "upgrade", bundleName });
+  return unwrapStructured(result, "upgrade");
+}
+
+/**
  * Install a connector. Pass the full `DirectoryEntry` the user
  * clicked plus the picked target `wsId` (the WorkspaceTargetPicker in
  * the install dialog is the source of truth). The server dispatches by

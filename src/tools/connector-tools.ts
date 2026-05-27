@@ -580,17 +580,16 @@ async function handleListInstalled(
     userLabelCache.set(userId, label);
     return label;
   };
-  // Use `<workDir>/apps` — same path BundleLifecycleManager is
-  // constructed with in runtime.ts. Dev's local nimblebrain.json
-  // sets `workDir: ".nimblebrain"` so this resolves to the cwd-local
-  // cache; production's default workDir is `~/.nimblebrain`. Matching
-  // the lifecycle's mpakHome means we read from the same singleton
-  // mpak cache the install path populated.
-  const mpak = getMpak(join(workDir, "apps"));
+  // Resolved mpak home — the SAME (absolute) string the lifecycle is
+  // constructed with, so `getMpak()`'s singleton is shared rather than
+  // thrashed. Don't hand-build `join(workDir, "apps")`: `getWorkDir()` isn't
+  // pre-resolved, so under a relative dev `workDir` it would key a second SDK
+  // instance on a relative string for the same dir.
+  const mpak = getMpak(ctx.runtime.getMpakHome());
 
   // Workspace-scope entries: walk every bundle visible in the workspace
   // registry (includes local stdio, local URL, Synapse apps, and remote
-  // OAuth). This is the same view the About tab uses via list_apps.
+  // OAuth). The `list_apps` tool surfaces the same registry-installed set.
   if ((scope === "all" || scope === "workspace") && wsId) {
     const registry = ctx.runtime.getRegistryForWorkspace(wsId);
     // One workspace fetch covers oauthOperatorApps lookups for every
@@ -1330,6 +1329,17 @@ async function handleInstallMpak(
       };
     }
   }
+
+  // Install does NOT force-refresh the shared mpak cache. App *version* is an
+  // org-global concern: the cache is keyed by name only (no version) and shared
+  // across every workspace, so a force-pull here would let a workspace admin
+  // silently bump every workspace's version on its next respawn — bypassing the
+  // org_admin `manage_apps.upgrade` gate. Instead, a ws_admin install adopts
+  // whatever version the org already has cached; a first-ever install cold-
+  // downloads the current release via `prepareServer`. The original "stuck on a
+  // bad version" incident stays cured WITHOUT a force-pull here: a gate-failing
+  // cached manifest self-heals on spawn (`startBundleSource` force-repulls on a
+  // HostManifestGateError, on the install path too).
 
   // Persist the slugified canonical reverse-DNS form as the BundleRef's
   // serverName so this install — and every lookup that follows — uses
