@@ -8,11 +8,13 @@ import {
   useRef,
   useState,
 } from "react";
+import { useLocation } from "react-router-dom";
 import { callTool } from "../api/client";
 import { chatStore } from "../hooks/chat-store";
 import type { UseChatReturn } from "../hooks/useChat";
 import { useChat } from "../hooks/useChat";
 import type { AppContext, ConfigInfo } from "../types";
+import { useWorkspaceContext } from "./WorkspaceContext";
 
 // ---------------------------------------------------------------------------
 // ChatConfigContext — stable values that change rarely (config, preferences)
@@ -65,7 +67,18 @@ export function ChatProvider({
   initialConfig,
   currentUserId,
 }: ChatProviderProps) {
-  const chat = useChat(initialConversationId, currentUserId);
+  // The chat is FOCUSED on the workspace the user is currently VIEWING — the
+  // `/w/:slug` route. This is situational context for the agent (which
+  // workspace/app is on screen) and the source of the workspace briefing. On
+  // home / identity routes (`/`, `/conversations`) there's no focus, so the
+  // chat is identity-level (no "current workspace"). Route-derived, NOT the
+  // persisted global active workspace.
+  const location = useLocation();
+  const { activeWorkspace } = useWorkspaceContext();
+  const focusWorkspaceId = location.pathname.startsWith("/w/")
+    ? (activeWorkspace?.id ?? null)
+    : null;
+  const chat = useChat(initialConversationId, currentUserId, focusWorkspaceId);
 
   // Drop every cached conversation slice when the signed-in user changes
   // (logout → login as someone else in the same tab). Conversations are

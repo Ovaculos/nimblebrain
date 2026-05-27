@@ -1,6 +1,7 @@
 import { act, renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it, mock } from "bun:test";
 import type { ReactNode } from "react";
+import { MemoryRouter } from "react-router-dom";
 import { ChatProvider, useChatContext } from "../src/context/ChatContext.tsx";
 import type { ChatMessage } from "../src/hooks/useChat.ts";
 
@@ -55,7 +56,11 @@ mock.module("../src/api/client", () => ({
 }));
 
 function wrapper({ children }: { children: ReactNode }) {
-  return <ChatProvider>{children}</ChatProvider>;
+  return (
+    <MemoryRouter>
+      <ChatProvider>{children}</ChatProvider>
+    </MemoryRouter>
+  );
 }
 
 function lastAssistant(messages: ChatMessage[]): ChatMessage | undefined {

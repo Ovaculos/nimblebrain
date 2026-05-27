@@ -4,6 +4,7 @@ import type { UserIdentity } from "../identity/provider.ts";
 import { ORG_ADMIN_ROLES } from "../identity/types.ts";
 import type { UserStore } from "../identity/user.ts";
 import { PersonalWorkspaceInvariantError } from "../workspace/errors.ts";
+import type { WorkspaceMember } from "../workspace/types.ts";
 import type { WorkspaceStore } from "../workspace/workspace-store.ts";
 import type { InProcessTool } from "./in-process-app.ts";
 
@@ -41,7 +42,7 @@ export function createManageWorkspacesTool(ctx: ManageWorkspacesContext): InProc
   return {
     name: "manage_workspaces",
     description:
-      "Manage workspaces and their members. Workspace CRUD requires org admin. Member management requires workspace or org admin. Conversation sharing was removed in Stage 1 of the delegation-model refactor and returns in Stage 4 with policy-gated primitives.",
+      "Manage workspaces and their members. Workspace CRUD requires org admin. Member management requires workspace or org admin. Conversation sharing was removed in Stage 1 of the cross-workspace refactor and returns in Stage 4 with policy-gated primitives.",
     inputSchema: {
       type: "object",
       properties: {
@@ -65,7 +66,8 @@ export function createManageWorkspacesTool(ctx: ManageWorkspacesContext): InProc
         },
         slug: {
           type: "string",
-          description: "Optional slug override (for create). Derived from name if omitted.",
+          description:
+            "Optional explicit id slug (for create), producing id 'ws_<slug>'. Omit to get an opaque, name-independent id (the default and recommended path — the workspace name stays freely editable without changing the id or URL).",
         },
         workspaceId: {
           type: "string",
@@ -324,6 +326,11 @@ async function handleList(ctx: ManageWorkspacesContext): Promise<ToolResult> {
         // web client gate workspace-admin UI without an extra `list_members`
         // round-trip per workspace.
         ...(userRole ? { userRole } : {}),
+        // `isPersonal` is consumed by T010's WorkspaceTargetPicker to
+        // preselect the personal workspace for personal-typical
+        // connectors. Pre-Stage-1 workspaces return `false`; the
+        // picker degrades to "no preselection" gracefully.
+        isPersonal: ws.isPersonal === true,
       };
     });
     const data = { workspaces: result };
@@ -519,6 +526,18 @@ async function handleAddMember(
   }
 }
 
+/**
+ * Count workspace admins whose underlying user is still active (not
+ * soft-deleted). The last-admin guards use this so a deactivated admin — who
+ * can't actually act, since the auth layer denies them — never counts toward
+ * the minimum. Mirrors `activeOwnerCount` in user-tools.ts at the workspace level.
+ */
+async function activeAdminCount(members: WorkspaceMember[], userStore: UserStore): Promise<number> {
+  const admins = members.filter((m) => m.role === "admin");
+  const users = await Promise.all(admins.map((m) => userStore.get(m.userId)));
+  return users.filter((u) => !u?.deletedAt).length;
+}
+
 async function handleRemoveMember(
   ctx: ManageMembersContext,
   workspaceId: string,
@@ -550,8 +569,10 @@ async function handleRemoveMember(
   }
 
   if (target.role === "admin") {
-    const adminCount = ws.members.filter((m) => m.role === "admin").length;
-    if (adminCount <= 1) {
+    // Only guard when the target is an active admin — removing an already
+    // deactivated admin can't drop the active-admin count below the minimum.
+    const targetUser = await ctx.userStore.get(userId);
+    if (!targetUser?.deletedAt && (await activeAdminCount(ws.members, ctx.userStore)) <= 1) {
       return {
         content: textContent("Cannot remove the last workspace admin."),
         isError: true,
@@ -629,8 +650,10 @@ async function handleUpdateMember(
   }
 
   if (target.role === "admin" && role === "member") {
-    const adminCount = ws.members.filter((m) => m.role === "admin").length;
-    if (adminCount <= 1) {
+    // Only guard when the target is an active admin — demoting an already
+    // deactivated admin can't drop the active-admin count below the minimum.
+    const targetUser = await ctx.userStore.get(userId);
+    if (!targetUser?.deletedAt && (await activeAdminCount(ws.members, ctx.userStore)) <= 1) {
       return {
         content: textContent("Cannot demote the last workspace admin."),
         isError: true,
@@ -675,7 +698,10 @@ async function handleListMembers(
     };
   }
 
-  // Enrich members with display names and emails from user profiles
+  // Enrich members with display names and emails from user profiles. Deactivated
+  // (soft-deleted) members keep their membership for clean restore, so surface
+  // deletedAt here too — the member still appears, flagged, rather than as a
+  // normal member (the second of the two surfaces the soft-delete fix targets).
   const enrichedMembers = await Promise.all(
     ws.members.map(async (m) => {
       const user = await ctx.userStore.get(m.userId);
@@ -684,6 +710,7 @@ async function handleListMembers(
         role: m.role,
         displayName: user?.displayName ?? m.userId,
         email: user?.email ?? "",
+        ...(user?.deletedAt ? { deletedAt: user.deletedAt } : {}),
       };
     }),
   );

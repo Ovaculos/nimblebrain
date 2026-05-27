@@ -9,6 +9,7 @@ import {
 import type { EventSink } from "../engine/types.ts";
 import {
   assertHostCapabilitiesAvailable,
+  HostManifestGateError,
   type HostResourcesRateLimit,
   type HostResourcesResolver,
 } from "../host-resources/index.ts";
@@ -50,8 +51,7 @@ import { validateBundleUrl } from "./url-validator.ts";
  *
  * Absent for in-process platform sources (which don't go through
  * `startBundleSource` anyway) and for paths that don't yet plumb the
- * deps (boot reload, configureBundle restart, connector eager-start —
- * follow-up).
+ * deps (boot reload, connector eager-start — follow-up).
  */
 export interface BundleMcpDeps {
   workspaceId: string;
@@ -221,7 +221,7 @@ export async function startBundleSource(
      * don't go through `prepareServer` for `user_config`.
      *
      * @deprecated Pass `workspaceContext` instead. Kept for incremental
-     * migration; see Task 007 in `.tasks/delegation-model/`.
+     * migration; see a follow-up migration.
      */
     wsId?: string;
     /**
@@ -255,7 +255,7 @@ export async function startBundleSource(
 ): Promise<StartBundleResult> {
   // Reconcile workspaceContext / wsId / workDir into a single context for
   // the rest of this function. Callers may pass either form; once
-  // .tasks/delegation-model/007 lands, everyone passes workspaceContext.
+  // the follow-up migration lands, everyone passes workspaceContext.
   const wsContext: WorkspaceContext | undefined = resolveWorkspaceContext(opts);
   if ("url" in ref) {
     const serverName = ref.serverName ?? deriveServerName(ref.url);
@@ -500,7 +500,7 @@ export async function startBundleSource(
     // pre-#195 installs whose ref doesn't carry the field. Mirrors the
     // URL-branch pattern below — without this the registered source
     // name would diverge from what install persisted, breaking
-    // `manage_app uninstall` for every catalog-installed mpak bundle
+    // uninstall for every catalog-installed mpak bundle
     // whose canonical id and package name produce different slugs
     // (e.g. `dev.mpak.nimblebraininc/echo` vs `@nimblebraininc/echo`).
     const serverName = ref.serverName ?? deriveServerName(ref.name);
@@ -535,7 +535,7 @@ export async function startBundleSource(
     // and resolve credentials BEFORE prepareServer validates them. The mpak
     // cache is populated during install (see BundleLifecycleManager.installNamed
     // or mpak install), so we expect the manifest to be present here.
-    const cachedManifest = mpak.bundleCache.getBundleManifest(ref.name) as BundleManifest | null;
+    let cachedManifest = mpak.bundleCache.getBundleManifest(ref.name) as BundleManifest | null;
     if (cachedManifest) {
       meta = extractBundleMeta(cachedManifest as unknown as Record<string, unknown>);
       manifest = cachedManifest;
@@ -559,6 +559,50 @@ export async function startBundleSource(
           "(http-proxy, host_capabilities, etc.) will be skipped at spawn, including " +
           "the install-time host-resources gate. Reinstall the bundle to repopulate.",
       );
+    }
+
+    // Boot / re-spawn self-heal for the name-only mpak cache. The cache dir is
+    // keyed by bundle name with no version, so a pod that cached a bad version
+    // re-spawns it on every boot — and if that manifest fails the host-manifest
+    // gate, the bundle is rejected forever even after a fixed version ships
+    // (the manual workaround was deleting the cache dir on the pod + restart).
+    // Detect the gate failure here, against the cached manifest, and force ONE
+    // re-pull from the registry so a published fix self-heals on restart. This
+    // sits before prepareServer so the fresh artifact is what gets spawned, and
+    // covers every named re-spawn path (boot reload, JIT install, configure-
+    // restart) since they all funnel through here. We do NOT re-assert the gate
+    // after refreshing — the terminal gate below (post-prepareServer) re-runs on
+    // the refreshed manifest and throws for real if the latest published
+    // version is still invalid.
+    if (cachedManifest) {
+      try {
+        assertHostCapabilitiesAvailable(cachedManifest, cachedManifest.name);
+      } catch (err) {
+        if (!(err instanceof HostManifestGateError)) throw err;
+        log.warn(
+          `[bundles] ${ref.name} failed the host-manifest gate from cache ` +
+            `(${err.reason}); force-refreshing from the registry and retrying.`,
+        );
+        try {
+          await mpak.bundleCache.loadBundle(ref.name, { force: true });
+          const refreshed = mpak.bundleCache.getBundleManifest(ref.name) as BundleManifest | null;
+          if (refreshed) {
+            cachedManifest = refreshed;
+            meta = extractBundleMeta(refreshed as unknown as Record<string, unknown>);
+            manifest = refreshed;
+          }
+        } catch (refreshErr) {
+          // Registry unreachable or pull failed: leave the cached copy intact
+          // and fall through. The terminal gate re-throws the original gate
+          // error, surfacing the actionable "Refusing to install" message
+          // rather than a transient network error — so we're never worse off
+          // than skipping the heal entirely.
+          const detail = refreshErr instanceof Error ? refreshErr.message : String(refreshErr);
+          log.warn(
+            `[bundles] force-refresh of ${ref.name} failed (${detail}); keeping cached copy.`,
+          );
+        }
+      }
     }
 
     // Read host-side credentials from the workspace credential store. The
@@ -663,7 +707,7 @@ function buildLocalSource(
     /**
      * Slugified canonical reverse-DNS form persisted at install time.
      * When present, used as the source name so the registered key
-     * matches what `manage_app uninstall` looks up; falls back to
+     * matches what uninstall looks up; falls back to
      * `deriveServerName(manifest.name)` for legacy installs.
      */
     serverName?: string;
@@ -692,8 +736,7 @@ function buildLocalSource(
   // Mirror the named-bundle branch: honor a persisted ref.serverName
   // (slugified canonical id from install) before falling back to the
   // legacy short slug. Keeps registered source name in lockstep with
-  // what consumers (manage_app uninstall, lifecycle Map, web routes)
-  // look up by.
+  // what consumers (uninstall, lifecycle Map, web routes) look up by.
   const serverName = ref.serverName ?? deriveServerName(manifest.name);
   validateServerName(serverName);
   const mcpConfig = manifest.server.mcp_config;

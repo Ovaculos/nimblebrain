@@ -14,6 +14,16 @@ export interface WorkspaceInfo {
   bundles: Array<{ name?: string; path?: string }>;
   /** The signed-in user's role within this workspace, when they're a member. */
   userRole?: "admin" | "member";
+  /**
+   * `true` for the user's personal workspace (auto-provisioned at first
+   * login, sole-owner-by-design). Drives the install dialog's preselection
+   * heuristic — personal-typical connectors (`defaultBinding: "personal"`)
+   * default to the personal workspace; non-personal workspaces require an
+   * explicit pick. The platform's bootstrap endpoint sets this; the
+   * `parseWorkspaceListResponse` fallback also propagates it so the
+   * shell mounted via either path agrees.
+   */
+  isPersonal?: boolean;
 }
 
 interface WorkspaceContextValue {
@@ -33,8 +43,6 @@ const WorkspaceContext = createContext<WorkspaceContextValue>({
   setActiveWorkspace: () => {},
   loading: true,
 });
-
-const STORAGE_KEY = "nb_active_workspace";
 
 // ---------------------------------------------------------------------------
 // Provider
@@ -59,26 +67,29 @@ export function WorkspaceProvider({
     hasBootstrap ? initialWorkspaces : [],
   );
   const [activeWorkspace, setActiveState] = useState<WorkspaceInfo | null>(() => {
+    // The default focus comes from the server (`initialActiveId`, the user's
+    // personal workspace). When the URL is a `/w/:slug` deep-link, the route
+    // guard overrides this from the slug. There is no persisted "remembered
+    // selection" — the URL is the single source of truth for which workspace
+    // the user is in.
     if (hasBootstrap && initialWorkspaces.length > 0) {
       const active = initialActiveId
         ? (initialWorkspaces.find((w) => w.id === initialActiveId) ?? initialWorkspaces[0])
         : initialWorkspaces[0];
-      if (active) setActiveWorkspaceId(active.id);
+      if (active) {
+        setActiveWorkspaceId(active.id);
+      }
       return active ?? null;
     }
     return null;
   });
   const [loading, setLoading] = useState(!hasBootstrap);
 
-  // Persist selection and sync header
+  // Update the focused workspace + sync the request header. Driven by the URL
+  // (route guard) and explicit user picks — not persisted across sessions.
   const setActiveWorkspace = useCallback((ws: WorkspaceInfo) => {
     setActiveState(ws);
     setActiveWorkspaceId(ws.id);
-    try {
-      localStorage.setItem(STORAGE_KEY, ws.id);
-    } catch {
-      // localStorage may be unavailable
-    }
   }, []);
 
   // Fallback: fetch via tool call when no bootstrap data is provided
@@ -110,10 +121,10 @@ export function WorkspaceProvider({
 
         setWorkspaces(list);
 
-        // Restore persisted selection or pick first
-        const savedId = localStorage.getItem(STORAGE_KEY);
-        const saved = savedId ? list.find((w) => w.id === savedId) : null;
-        const initial = saved ?? list[0] ?? null;
+        // No bootstrap data → default the focus to the personal workspace,
+        // then the first membership. No persisted selection to restore; the
+        // URL (route guard) overrides this when it's a `/w/:slug` deep-link.
+        const initial = list.find((w) => w.isPersonal) ?? list[0] ?? null;
 
         if (initial) {
           setActiveState(initial);

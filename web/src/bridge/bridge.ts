@@ -32,7 +32,9 @@ import {
   GetTaskResultSchema,
   TaskStatusNotificationSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { uploadResource } from "../api/client";
+import { getActiveWorkspaceId, uploadResource } from "../api/client";
+import { isIdentityApp } from "../lib/identity-apps";
+import { namespacedToolName } from "../lib/namespaced-tool";
 import { getMcpBridgeClient, withSessionRetry } from "../mcp-bridge-client";
 import { getHostThemeMode, getSpecThemeTokens, getThemeTokens } from "./theme";
 import type {
@@ -355,8 +357,7 @@ export function createBridge(
 
       // -----------------------------------------------------------------
       // Spec: tasks/cancel — best-effort cancel; returns the (final)
-      // task state. Cancelling a terminal task surfaces as `-32602` per
-      // SPEC_REFERENCE §8.
+      // task state. Cancelling a terminal task surfaces as `-32602`.
       // -----------------------------------------------------------------
       case "tasks/cancel": {
         const { id, params } = msg;
@@ -685,12 +686,40 @@ async function callToolViaMcp(
   params: ToolsCallParams,
   id: string,
 ): Promise<UiToolResultResponse | UiToolResultError | Record<string, unknown>> {
-  // The `/mcp` endpoint advertises tool names as `<source>__<tool>`, so
-  // the wire `tools/call` must use the qualified form (see
-  // `mcp-server.ts::CallToolRequestSchema`). Iframes that already pass a
-  // qualified name flow through unchanged; bare names get prefixed with
-  // the resolved `server` (post-INTERNAL_APPS authz).
-  const wireName = params.name.includes("__") ? params.name : `${server}__${params.name}`;
+  // The `/mcp` endpoint expects a tool name whose shape encodes its scope.
+  // Two transformations:
+  //
+  //   1. Qualified: iframes pass either `<tool>` (bare) or
+  //      `<source>__<tool>` (already qualified). Normalize to the qualified
+  //      form using the post-INTERNAL_APPS-authz `server`.
+  //   2. Scoped: how the name is scoped depends on the app's door:
+  //      - Identity apps (conversations, …) are owned by the user and live
+  //        OUTSIDE any workspace, so they dispatch BARE — the orchestrator
+  //        routes a bare `<source>__<tool>` through the identity door. No
+  //        active workspace is required (there is none).
+  //      - Workspace apps prefix `ws_<active>-`. The iframe is mounted under
+  //        the current URL's workspace (`/w/<slug>/app/<bundle>`), so the
+  //        active workspace == the iframe's host workspace. (Side-by-side
+  //        iframes from different workspaces would need the host captured at
+  //        bridge construction instead.)
+  const qualifiedName = params.name.includes("__") ? params.name : `${server}__${params.name}`;
+  let wireName: string;
+  if (isIdentityApp(server)) {
+    wireName = qualifiedName;
+  } else {
+    const activeWsId = getActiveWorkspaceId();
+    if (!activeWsId) {
+      return {
+        jsonrpc: "2.0",
+        id,
+        error: {
+          code: -32000,
+          message: "No active workspace; cannot dispatch tool call.",
+        },
+      } satisfies UiToolResultError;
+    }
+    wireName = namespacedToolName(activeWsId, qualifiedName);
+  }
 
   return withSessionRetry(async () => {
     const client = await getMcpBridgeClient();

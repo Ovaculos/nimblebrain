@@ -5,11 +5,10 @@ import {
   type AuthMiddlewareOptions,
   authenticateRequest,
   isAuthError,
-  resolveWorkspace,
-  WorkspaceResolutionError,
 } from "../auth-middleware.ts";
-import type { McpWorkspaceContext } from "../mcp-server.ts";
+import type { McpSessionContext } from "../mcp-server.ts";
 import { bodyLimit } from "../middleware/body-limit.ts";
+import { requestRateLimit } from "../middleware/rate-limit.ts";
 import { type AppContext, type AuthEnv, apiError } from "../types.ts";
 
 /**
@@ -75,39 +74,37 @@ export function mcpRoutes(ctx: AppContext) {
   const app = new Hono<AuthEnv>();
   app.use("*", requireMcpAuth(ctx.authOptions, ctx));
 
-  app.all("/mcp", bodyLimit(1_048_576), async (c) => {
-    const features = ctx.runtime.getFeatures();
+  // Rate limit the remote surface: external MCP clients + sandboxed bundle
+  // iframes (the bridge speaks `/mcp`). Chained on the route, NOT `.use("*")`,
+  // so it can't leak onto sibling routes — and it runs after `requireMcpAuth`
+  // above, so the per-identity key is populated. Bypassed in dev.
+  app.all(
+    "/mcp",
+    requestRateLimit(ctx.mcpLimiter, { bypass: ctx.isDevMode }),
+    bodyLimit(1_048_576),
+    async (c) => {
+      const features = ctx.runtime.getFeatures();
 
-    // Every MCP request must be workspace-scoped
-    const identity = c.var.identity;
-    if (!identity || !ctx.workspaceStore) {
-      return apiError(
-        401,
-        "unauthorized",
-        "Authentication required for MCP",
-        undefined,
-        hasAuthkitOAuth(ctx) ? { "WWW-Authenticate": mcpWwwAuthenticate(c.req.raw) } : undefined,
-      );
-    }
-
-    let wsId: string;
-    try {
-      wsId = await resolveWorkspace(c.req.raw, identity, ctx.workspaceStore);
-    } catch (e) {
-      if (e instanceof WorkspaceResolutionError) {
-        return apiError(e.statusCode, "workspace_error", e.message);
+      // Stage 2: `/mcp` sessions are identity-bound only. The `X-Workspace-Id`
+      // header is no longer consulted here — the host logs once at debug
+      // (`NB_DEBUG=mcp`) if a client still sends one. Tool calls derive their
+      // target workspace from the namespaced tool name on every call (parsed
+      // and routed by the orchestrator).
+      const identity = c.var.identity;
+      if (!identity || !ctx.workspaceStore) {
+        return apiError(
+          401,
+          "unauthorized",
+          "Authentication required for MCP",
+          undefined,
+          hasAuthkitOAuth(ctx) ? { "WWW-Authenticate": mcpWwwAuthenticate(c.req.raw) } : undefined,
+        );
       }
-      throw e;
-    }
 
-    const registry = await ctx.runtime.ensureWorkspaceRegistry(wsId);
-    const mcpWorkspaceCtx: McpWorkspaceContext = {
-      registry,
-      identity,
-      workspaceId: wsId,
-    };
-    return ctx.mcpHost.handle(c.req.raw, registry, features, mcpWorkspaceCtx);
-  });
+      const sessionCtx: McpSessionContext = { identity };
+      return ctx.mcpHost.handle(c.req.raw, features, sessionCtx);
+    },
+  );
 
   return app;
 }

@@ -29,13 +29,18 @@ export function getAuthToken(): string | null {
 }
 
 /**
- * Hook fired whenever the auth token or active workspace changes — used by
- * stateful clients that hold a session bound to one of those values. The
- * MCP bridge client (`mcp-bridge-client.ts`) registers here at module load
- * so its cached transport (workspace-bound `Mcp-Session-Id`) gets dropped
- * on workspace switch / logout instead of silently servicing the wrong
- * tenant. Stateless callers (REST helpers, `fetchWithRefresh`) read the
- * current token / workspace ID per-request and need no hook.
+ * Hook fired on logout / auth-token change — used by stateful clients that
+ * hold a session bound to the identity. The MCP bridge client
+ * (`mcp-bridge-client.ts`) registers here at module load so its cached
+ * transport gets dropped on logout instead of silently servicing the next
+ * identity. Stateless callers (REST helpers, `fetchWithRefresh`) read the
+ * current token per-request and need no hook.
+ *
+ * Stage 2 / Q3 (locked 2026-05-22): the `/mcp` session is identity-bound,
+ * not workspace-bound. Workspace switches do NOT drop the bridge session —
+ * `setActiveWorkspaceId` therefore no longer fires this hook. Cross-call
+ * workspace context is supplied per-request via the `X-Workspace-Id`
+ * header read fresh by the custom fetch in `mcp-bridge-client.ts`.
  */
 let onAuthLifecycleChange: (() => void) | null = null;
 export function setAuthLifecycleHandler(handler: (() => void) | null): void {
@@ -49,11 +54,14 @@ export function setAuthToken(token: string | null): void {
   onAuthLifecycleChange?.();
 }
 
-/** Set the active workspace ID included as X-Workspace-Id header. */
+/**
+ * Set the active workspace ID included as `X-Workspace-Id` header on REST
+ * + bridge fetches. Does NOT fire the auth lifecycle hook — per Q3 the
+ * `/mcp` bridge session survives workspace switches.
+ */
 export function setActiveWorkspaceId(id: string | null): void {
   if (activeWorkspaceId === id) return;
   activeWorkspaceId = id;
-  onAuthLifecycleChange?.();
 }
 
 /** Get the active workspace ID (for modules that build their own headers). */
@@ -64,6 +72,19 @@ export function getActiveWorkspaceId(): string | null {
 /** Register a callback invoked on 401 responses. */
 export function setOnAuthError(callback: (() => void) | null): void {
   onAuthError = callback;
+}
+
+/**
+ * Hook fired when any data call fails with `workspace_error` — the active
+ * `X-Workspace-Id` names a workspace the server rejects (deleted, lost
+ * membership, or malformed). The shell registers a handler that drops the
+ * stale selection and bounces to `/`, where bootstrap re-resolves a valid
+ * workspace. Symmetric to `onAuthError` for 401s: a bad workspace context is
+ * recoverable by re-resolving, not by showing the raw error.
+ */
+let onWorkspaceError: (() => void) | null = null;
+export function setOnWorkspaceError(callback: (() => void) | null): void {
+  onWorkspaceError = callback;
 }
 
 /** Store platform version info from bootstrap. */
@@ -136,7 +157,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       error: "unknown",
       message: res.statusText,
     }));
-    throw new ApiClientError(body.error, body.message, res.status, body.details);
+    throw errorFromResponse(body, res.status);
   }
 
   return res.json() as Promise<T>;
@@ -156,6 +177,25 @@ export class ApiClientError extends Error {
     super(message);
     this.name = "ApiClientError";
   }
+}
+
+/**
+ * Build the `ApiClientError` for a non-ok response, firing the
+ * workspace-error hook as a side effect when the failure is a stale/invalid
+ * workspace. Centralized so every REST helper inherits the redirect-home
+ * behavior rather than re-checking the code at each call site. The error is
+ * still thrown so callers' local error handling runs unchanged; the hook is
+ * additive recovery, not a replacement.
+ *
+ * Exported so the hook-firing seam is unit-testable directly. Driving it
+ * through `callTool` → `request` → fetch is unreliable in the full suite
+ * (the `mock.module("../api/client", ...)` stubs in other test files clobber
+ * `callTool` depending on evaluation order), so tests assert on this pure
+ * function instead.
+ */
+export function errorFromResponse(body: ApiError, status: number): ApiClientError {
+  if (body.error === "workspace_error") onWorkspaceError?.();
+  return new ApiClientError(body.error, body.message, status, body.details);
 }
 
 // ---------------------------------------------------------------------------
@@ -205,7 +245,7 @@ export async function getResources(
       error: "unknown",
       message: res.statusText,
     }));
-    throw new ApiClientError(body.error, body.message, res.status, body.details);
+    throw errorFromResponse(body, res.status);
   }
 
   const envelope = (await res.json()) as {
@@ -321,7 +361,7 @@ export async function uploadResource(files: File[]): Promise<UploadResourceResul
       error: "unknown",
       message: res.statusText,
     }));
-    throw new ApiClientError(body.error, body.message, res.status, body.details);
+    throw errorFromResponse(body, res.status);
   }
   return res.json() as Promise<UploadResourceResult>;
 }
@@ -352,10 +392,11 @@ export async function startChatTurn(req: ChatRequest): Promise<{ conversationId:
   });
   if (res.status === 401) throw new ApiClientError("unauthorized", "Unauthorized", 401);
   if (!res.ok) {
-    const body: ApiError = await res
-      .json()
-      .catch(() => ({ error: "unknown", message: res.statusText }));
-    throw new ApiClientError(body.error, body.message, res.status, body.details);
+    const body: ApiError = await res.json().catch(() => ({
+      error: "unknown",
+      message: res.statusText,
+    }));
+    throw errorFromResponse(body, res.status);
   }
   return res.json() as Promise<{ conversationId: string }>;
 }
@@ -384,10 +425,11 @@ export async function startChatTurnMultipart(
   });
   if (res.status === 401) throw new ApiClientError("unauthorized", "Unauthorized", 401);
   if (!res.ok) {
-    const body: ApiError = await res
-      .json()
-      .catch(() => ({ error: "unknown", message: res.statusText }));
-    throw new ApiClientError(body.error, body.message, res.status, body.details);
+    const body: ApiError = await res.json().catch(() => ({
+      error: "unknown",
+      message: res.statusText,
+    }));
+    throw errorFromResponse(body, res.status);
   }
   return res.json() as Promise<{ conversationId: string }>;
 }
@@ -431,19 +473,6 @@ export interface ShellData {
 /** Fetch the shell manifest (placement slots, endpoints). */
 export async function getShell(): Promise<ShellData> {
   return request<ShellData>("/v1/shell");
-}
-
-/**
- * Fetch the bootstrap payload (user, workspaces, shell, config) in one call.
- * `workspaceId` is the client's remembered last-active workspace — sent as
- * a soft hint to the server (unified under X-Workspace-Id). Bootstrap
- * honors it if still valid, silently falls back to the first membership
- * otherwise. Data endpoints treat the same header as authoritative.
- */
-export async function getBootstrap(workspaceId?: string): Promise<BootstrapResponse> {
-  const extra: Record<string, string> = {};
-  if (workspaceId) extra["X-Workspace-Id"] = workspaceId;
-  return request<BootstrapResponse>("/v1/bootstrap", { headers: extra });
 }
 
 /** Attempt to refresh the session using the refresh token cookie. Exposed for SSE modules. */
@@ -509,7 +538,7 @@ export interface ConnectorCatalogEntry {
   iconUrl: string;
   url: string;
   auth: "dcr" | "static" | "composio";
-  defaultScope: "workspace" | "user";
+  defaultBinding: "workspace" | "personal";
   requiredScopes?: string[];
   additionalAuthorizationParams?: Record<string, string>;
   operatorSetup?: { portalUrl: string; hint: string; clientSecretKey: string };
@@ -539,10 +568,14 @@ export interface BundleUserConfigField {
 }
 
 /**
- * Per-(scope, principal) installed view. Returns every bundle visible
- * in the workspace (or user) — local stdio servers, local URL bundles,
- * Synapse apps, and remote OAuth connectors. `type` distinguishes
- * remote URL connectors from local in-process / subprocess bundles.
+ * Per-workspace installed view. Returns every bundle visible in the
+ * workspace — local stdio servers, local URL bundles, Synapse apps, and
+ * remote OAuth connectors. `type` distinguishes remote URL connectors
+ * from local in-process / subprocess bundles. Personal connectors live
+ * in the caller's personal workspace.
+ *
+ * Stage 2: `scope` is always `"workspace"`. The legacy `"user"` arm was
+ * removed in T008/T009.
  */
 export interface InstalledConnector {
   serverName: string;
@@ -550,7 +583,7 @@ export interface InstalledConnector {
   version: string;
   type: "remote" | "local";
   state: string;
-  scope: "workspace" | "user";
+  scope: "workspace";
   /** Whether this connector exposes a UI surface (auto-mounts a sidebar entry). */
   interactive: boolean;
   toolCount: number;
@@ -635,7 +668,7 @@ function unwrapStructured<T>(result: ToolCallResult, what: string): T {
 }
 
 export async function getInstalledConnectors(opts?: {
-  scope?: "all" | "workspace" | "user";
+  scope?: "all" | "workspace";
 }): Promise<{ installed: InstalledConnector[] }> {
   const result = await callTool("nb", "manage_connectors", {
     action: "list_installed",
@@ -662,10 +695,10 @@ export async function getInstalledConnector(
 
 export async function disconnectConnector(
   serverName: string,
-  scope?: "workspace" | "user",
+  scope?: "workspace",
 ): Promise<{
   ok: boolean;
-  scope: "workspace" | "user";
+  scope: "workspace";
   revoked: { access?: boolean; refresh?: boolean };
   deletedLocal: boolean;
   revokeError?: string;
@@ -685,8 +718,8 @@ export async function disconnectConnector(
  */
 export async function uninstallConnector(
   serverName: string,
-  scope: "workspace" | "user",
-): Promise<{ ok: boolean; scope: "workspace" | "user"; serverName: string }> {
+  scope: "workspace",
+): Promise<{ ok: boolean; scope: "workspace"; serverName: string }> {
   const result = await callTool("nb", "manage_connectors", {
     action: "uninstall",
     serverName,
@@ -696,21 +729,78 @@ export async function uninstallConnector(
 }
 
 /**
- * Install a connector. Pass the full `DirectoryEntry` the user
- * clicked — server dispatches by `entry.install.kind`. Idempotent;
- * already-installed connectors return `alreadyInstalled: true`.
- * Does NOT start OAuth — caller follows up with
- * `initiateMcpOAuth(serverName)` for remote-OAuth installs.
+ * One installed registry app, aggregated org-wide (deduped by bundle name).
+ * App version is org-global because the mpak cache is shared platform-wide —
+ * see `src/tools/app-tools.ts`.
  */
-export async function installConnector(entry: DirectoryEntry): Promise<{
+export interface OrgApp {
+  bundleName: string;
+  version: string;
+  trustScore: number | null;
+  workspaceCount: number;
+  workspaceIds: string[];
+}
+
+/** One available app update. */
+export interface AppUpdate {
+  bundleName: string;
+  current: string;
+  latest: string;
+}
+
+/** List installed registry apps across the org (org_admin). */
+export async function listApps(): Promise<{ apps: OrgApp[] }> {
+  const result = await callTool("nb", "manage_apps", { action: "list" });
+  return unwrapStructured(result, "list");
+}
+
+/** Check the registry for newer app versions across the org (org_admin). */
+export async function checkAppUpdates(): Promise<{ updates: AppUpdate[] }> {
+  const result = await callTool("nb", "manage_apps", { action: "check_updates" });
+  return unwrapStructured(result, "check_updates");
+}
+
+/**
+ * Upgrade an app to its latest version across every workspace that has it
+ * (org_admin). `upgraded` is false when already at latest; `workspaces` reports
+ * per-workspace success.
+ */
+export async function upgradeApp(bundleName: string): Promise<{
+  ok: boolean;
+  upgraded: boolean;
+  bundleName: string;
+  from: string;
+  to: string;
+  workspaces: Array<{ wsId: string; ok: boolean; error?: string }>;
+}> {
+  const result = await callTool("nb", "manage_apps", { action: "upgrade", bundleName });
+  return unwrapStructured(result, "upgrade");
+}
+
+/**
+ * Install a connector. Pass the full `DirectoryEntry` the user
+ * clicked plus the picked target `wsId` (the WorkspaceTargetPicker in
+ * the install dialog is the source of truth). The server dispatches by
+ * `entry.install.kind` and hard-errors when `wsId` is missing —
+ * Stage 1 precedent: `startBundleSource` refuses to default to
+ * personal. Idempotent; already-installed connectors return
+ * `alreadyInstalled: true`. Does NOT start OAuth — caller follows up
+ * with `initiateMcpOAuth(serverName)` for remote-OAuth installs.
+ */
+export async function installConnector(
+  entry: DirectoryEntry,
+  wsId: string,
+): Promise<{
   ok: boolean;
   alreadyInstalled: boolean;
   serverName: string;
-  scope: "workspace" | "user";
+  scope: "workspace";
+  wsId: string;
 }> {
   const result = await callTool("nb", "manage_connectors", {
     action: "install",
     entry,
+    wsId,
   });
   return unwrapStructured(result, "install");
 }
@@ -734,7 +824,7 @@ export interface DirectoryEntry {
   description: string;
   iconUrl?: string;
   tags?: string[];
-  defaultScope: "user" | "workspace";
+  defaultBinding: "personal" | "workspace";
   /**
    * Static-auth entries: true when the workspace has both clientId and
    * client_secret configured. Undefined for entries where operator
@@ -891,9 +981,9 @@ export type ToolPolicy = "allow" | "disallow";
  */
 export async function listConnectorToolsWithPermissions(
   serverName: string,
-  scope?: "workspace" | "user",
+  scope?: "workspace",
 ): Promise<{
-  scope: "workspace" | "user";
+  scope: "workspace";
   serverName: string;
   tools: ConnectorTool[];
   permissions: Record<string, ToolPolicy>;
@@ -908,9 +998,9 @@ export async function listConnectorToolsWithPermissions(
 
 export async function setConnectorPermissions(
   serverName: string,
-  scope: "workspace" | "user",
+  scope: "workspace",
   tools: Record<string, ToolPolicy>,
-): Promise<{ ok: boolean; scope: "workspace" | "user"; serverName: string }> {
+): Promise<{ ok: boolean; scope: "workspace"; serverName: string }> {
   const result = await callTool("nb", "manage_connectors", {
     action: "set_permissions",
     serverName,
@@ -944,19 +1034,21 @@ export async function logout(): Promise<void> {
  * initFromBootstrap, after this call) so a failed refresh just leaves the
  * 401 in place and we return null — same behavior as before.
  *
- * `workspaceId` is the client's remembered last-active workspace — see
- * {@link getBootstrap} for the server-side contract.
+ * Bootstrap carries NO `X-Workspace-Id`. Which workspace the user is in is
+ * owned by the URL (`/w/:slug`), resolved AFTER bootstrap by the route
+ * guard — not by a remembered selection. Sending a stale remembered id was
+ * the cause of a hard lock-out: a workspace the user had lost access to made
+ * the server reject bootstrap before its permissive default could run. The
+ * server defaults the focus to the user's personal workspace on its own.
  */
-export async function tryBootstrap(workspaceId?: string): Promise<BootstrapResponse | null> {
+export async function tryBootstrap(): Promise<BootstrapResponse | null> {
   try {
-    const extra: Record<string, string> = {};
-    if (workspaceId) extra["X-Workspace-Id"] = workspaceId;
+    // Strip any workspace scope — bootstrap is identity-level discovery.
+    const h = headers();
+    delete h["X-Workspace-Id"];
     const res = await fetchWithRefresh(`${API_BASE}/v1/bootstrap`, {
       credentials: "include",
-      headers: {
-        ...headers(),
-        ...extra,
-      },
+      headers: h,
     });
     if (!res.ok) return null;
     return (await res.json()) as BootstrapResponse;

@@ -84,13 +84,26 @@ export function startServer(options: ServerOptions): ServerHandle {
   const rateLimiter = new LoginRateLimiter();
   rateLimiter.start();
 
-  // Per-user request rate limiters for expensive endpoints
+  // Per-identity request rate limiters. The limit lives on the caller's
+  // trust class, not "is it expensive":
+  //   - `/mcp` (mcpLimiter) is the remote/untrusted surface — external MCP
+  //     clients and sandboxed bundle iframes. This is the real abuse vector,
+  //     so it carries a present-but-generous cap.
+  //   - `/v1/tools/call` (toolCallLimiter) is the trusted first-party shell.
+  //     Its only failure mode is a runaway client loop, so the ceiling is
+  //     high — far above human navigation, low enough to stop a hot loop.
+  //   - `/v1/chat` (chatLimiter) is first-party + LLM-expensive, so it stays
+  //     modest.
+  // All are bypassed in dev mode (see `isDevMode` below).
   const chatRateLimit = Number(process.env.NB_CHAT_RATE_LIMIT) || 20;
-  const toolRateLimit = Number(process.env.NB_TOOL_RATE_LIMIT) || 60;
+  const toolRateLimit = Number(process.env.NB_TOOL_RATE_LIMIT) || 600;
+  const mcpRateLimit = Number(process.env.NB_MCP_RATE_LIMIT) || 300;
   const chatLimiter = new RequestRateLimiter(chatRateLimit, 60_000);
   chatLimiter.start();
   const toolCallLimiter = new RequestRateLimiter(toolRateLimit, 60_000);
   toolCallLimiter.start();
+  const mcpLimiter = new RequestRateLimiter(mcpRateLimit, 60_000);
+  mcpLimiter.start();
 
   // Wire runtime events to the SSE manager by subscribing to the event sink.
   const runtimeSink = runtime.getEventSink();
@@ -158,8 +171,15 @@ export function startServer(options: ServerOptions): ServerHandle {
     }
   };
 
-  // Resolve identity provider
+  // Resolve identity provider. `isDevMode` is captured BEFORE the dev
+  // substitution: when no real provider is configured we still install a
+  // DevIdentityProvider (so the local app authenticates as a single
+  // `usr_default`), which makes `authMode` look like a real adapter. The
+  // honest "is this local dev" signal is therefore "was a real provider
+  // configured", not the post-substitution auth mode. Request rate limiting
+  // keys off this to bypass in dev.
   let effectiveProvider: IdentityProvider | null = optProvider ?? runtime.getIdentityProvider();
+  const isDevMode = effectiveProvider === null;
   if (!effectiveProvider) {
     const workDir = runtime.getWorkDir();
     effectiveProvider = new DevIdentityProvider(
@@ -182,7 +202,11 @@ export function startServer(options: ServerOptions): ServerHandle {
   // reclaim the same logical session on the same schedule, with the host's
   // sweep being what actually frees the JS heap. The registry TTL is a
   // backstop on the metadata layer for the cluster-shared view.
-  const mcpHost = new McpServerHost({ registry: sessionRegistry, idleTtlMs: sessionTtlMs });
+  const mcpHost = new McpServerHost({
+    registry: sessionRegistry,
+    runtime,
+    idleTtlMs: sessionTtlMs,
+  });
 
   // Build shared context for all route groups
   const ctx: AppContext = {
@@ -191,13 +215,14 @@ export function startServer(options: ServerOptions): ServerHandle {
     authOptions: { mode: authMode, internalToken, eventSink: runtime.getEventSink() },
     provider: effectiveProvider,
     workspaceStore: runtime.getWorkspaceStore(),
-    userConnectorStore: runtime.getUserConnectorStore(),
     healthMonitor,
     sseManager,
     conversationEventManager,
     rateLimiter,
     chatLimiter,
     toolCallLimiter,
+    mcpLimiter,
+    isDevMode,
     eventSink: runtime.getEventSink(),
     isLocalhost: true, // Updated after Bun.serve starts
     appOrigin: allowedOrigins ? [...allowedOrigins][0] : undefined,
@@ -229,6 +254,7 @@ export function startServer(options: ServerOptions): ServerHandle {
       rateLimiter.stop();
       chatLimiter.stop();
       toolCallLimiter.stop();
+      mcpLimiter.stop();
       sseManager.stop();
       conversationEventManager.stop();
       healthMonitor.stop();

@@ -14,7 +14,7 @@ function createCapturingModel() {
 		const systemMsg = options.prompt.find((m) => m.role === "system");
 		if (systemMsg && typeof systemMsg.content === "string") {
 			// Skip auto-title calls
-			if (!systemMsg.content.includes("descriptive titles for conversations")) {
+			if (!systemMsg.content.includes("Generate a 3-6 word title")) {
 				capturedSystem = systemMsg.content;
 			}
 		}

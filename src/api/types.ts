@@ -3,7 +3,6 @@ import type { EventSink } from "../engine/types.ts";
 import type { IdentityProvider, UserIdentity } from "../identity/provider.ts";
 import type { Runtime } from "../runtime/runtime.ts";
 import type { HealthMonitor } from "../tools/health-monitor.ts";
-import type { UserConnectorStore } from "../users/user-connector-store.ts";
 import type { WorkspaceStore } from "../workspace/workspace-store.ts";
 import type { AuthMiddlewareOptions } from "./auth-middleware.ts";
 import type { ConversationEventManager } from "./conversation-events.ts";
@@ -68,19 +67,20 @@ export interface AppContext {
   authOptions: AuthMiddlewareOptions;
   provider: IdentityProvider;
   workspaceStore: WorkspaceStore;
-  /**
-   * Per-user storage for personal connectors. Sits parallel to
-   * workspaceStore — `users/<userId>/user.json` for personal bundles +
-   * `users/<userId>/credentials/...` for the OAuth tokens those bundles
-   * authenticate against.
-   */
-  userConnectorStore: UserConnectorStore;
   healthMonitor: HealthMonitor;
   sseManager: SseEventManager;
   conversationEventManager: ConversationEventManager;
   rateLimiter: LoginRateLimiter;
   chatLimiter: RequestRateLimiter;
   toolCallLimiter: RequestRateLimiter;
+  /** Per-identity limiter for the remote `/mcp` surface (external clients + bundle iframes). */
+  mcpLimiter: RequestRateLimiter;
+  /**
+   * True when no real identity provider is configured (local dev — a
+   * `DevIdentityProvider` is substituted). Request rate limiting is bypassed
+   * in this mode; see `requestRateLimit`.
+   */
+  isDevMode: boolean;
   eventSink: EventSink;
   isLocalhost: boolean;
   appOrigin: string | undefined;

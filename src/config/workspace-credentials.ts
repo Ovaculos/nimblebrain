@@ -348,8 +348,9 @@ export interface ResolveUserConfigInput {
   gate?: ConfirmationGate;
   /**
    * If `true`, prompt for every field via the gate and persist responses to
-   * the workspace store. Used by the `nb__manage_app configure` TUI action.
-   * No effect when `gate?.supportsInteraction` is false.
+   * the workspace store — the interactive "re-enter all credentials" path,
+   * for updating existing values. No effect when `gate?.supportsInteraction`
+   * is false.
    */
   forcePrompt?: boolean;
 }
@@ -517,13 +518,13 @@ export class WorkspaceCredentialStore {
 //
 // These remain for incremental migration. Every call site outside this
 // module is being moved to `WorkspaceCredentialStore` (or its owner
-// `WorkspaceContext`) in Stage 0 of the delegation-model refactor; once
+// `WorkspaceContext`) in Stage 0 of the cross-workspace refactor; once
 // the audit grep returns zero, the shims are deleted.
 
 /**
  * @deprecated Use `workspaceContext.getCredentialStore().get(bundleName)`.
  * Kept for incremental migration; will be removed once all call sites are
- * updated (see `.tasks/delegation-model/`).
+ * updated.
  */
 export async function getWorkspaceCredentials(
   wsId: string,

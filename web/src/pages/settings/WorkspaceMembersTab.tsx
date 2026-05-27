@@ -15,11 +15,11 @@ import { useWorkspaceContext } from "../../context/WorkspaceContext";
 import { EmptyState, RequireActiveWorkspace, SettingsListPage } from "./components";
 
 /**
- * Active-workspace "Members" tab — list view.
+ * Workspace "Members" tab — list view.
  *
  * Edit affordances (add/remove/role-change) live on the admin path
- * (`/settings/org/workspaces/:slug` → `WorkspaceDetailPage`). This page is
- * intentionally read-only because the active-workspace surface is for
+ * (`/org/workspaces/:slug` → `WorkspaceDetailPage`). This page is
+ * intentionally read-only because the workspace settings surface is for
  * everyone, not just admins.
  */
 export function WorkspaceMembersTab() {
@@ -33,6 +33,8 @@ export function WorkspaceMembersTab() {
 interface Member {
   userId: string;
   role: string;
+  /** Set when the member's user account is deactivated (soft-deleted). */
+  deletedAt?: string;
 }
 
 interface UserInfo {
@@ -111,9 +113,17 @@ function Inner() {
           <TableBody>
             {members.map((m) => {
               const user = userMap.get(m.userId);
+              const isDeactivated = Boolean(m.deletedAt);
               return (
-                <TableRow key={m.userId}>
-                  <TableCell className="font-medium">{user?.displayName ?? m.userId}</TableCell>
+                <TableRow key={m.userId} className={isDeactivated ? "opacity-60" : undefined}>
+                  <TableCell className="font-medium">
+                    {user?.displayName ?? m.userId}
+                    {isDeactivated ? (
+                      <span className="ml-2 rounded bg-muted px-1.5 py-0.5 text-xs font-normal text-muted-foreground">
+                        Deactivated
+                      </span>
+                    ) : null}
+                  </TableCell>
                   <TableCell>{user?.email ?? "—"}</TableCell>
                   <TableCell>
                     <RoleBadge role={m.role} />

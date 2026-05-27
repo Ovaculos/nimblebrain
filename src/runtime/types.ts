@@ -221,9 +221,33 @@ export interface ChatRequest {
   conversationId?: string;
   model?: string;
   maxIterations?: number;
-  /** Workspace scope for this request. Resolved by middleware from header, conversation, or default. */
+  /**
+   * The workspace the chat is *focused* on (the `/w/:slug` the user is
+   * viewing, plumbed from the `X-Workspace-Id` header). Drives the
+   * deterministic, workspace-scoped **briefing**: the Installed Apps
+   * section and the org/workspace instruction overlays reflect THIS
+   * workspace, identical for every member (no per-user generation).
+   *
+   * NOT tool scope. Tools remain the cross-workspace union
+   * (`aggregateToolList(identityId)`); re-introducing this field does not
+   * re-narrow tools to one workspace (what T006 removed). Absent → the
+   * chat isn't focused on a workspace (e.g. the future home control
+   * panel); for now it falls back to the personal workspace as a
+   * temporary bridge, NOT a claim that home == the personal workspace.
+   */
   workspaceId?: string;
-  /** When set, the chat is scoped to a specific app. */
+  /**
+   * When set, the chat is scoped to a specific app.
+   *
+   * Stage 2 (cross-workspace): the chat surface is identity-bound, not
+   * workspace-bound. Tools come from the cross-workspace aggregator
+   * (`orchestrator.aggregateToolList(identityId)`) and each tool call
+   * routes through the orchestrator's parsed-namespace path. The
+   * `workspaceId` field above is the *focused* workspace for the
+   * deterministic briefing (apps + overlays) only — it does NOT narrow
+   * the tool list. Per-call workspace attribution lives on the tool's
+   * namespace prefix.
+   */
   appContext?: AppContext;
   /** Additional content parts from file uploads (text extracts, images). */
   contentParts?: ContentPart[];
@@ -276,9 +300,17 @@ export interface TurnUsage extends TokenUsage {
 export interface ChatResult {
   response: string;
   conversationId: string;
-  /** Workspace ID this chat was scoped to, if any. */
-  workspaceId?: string;
   skillName: string | null;
+  /**
+   * Tool calls executed during this run. `name` is the canonical
+   * namespaced form `ws_<id>-<source>__<tool>` — Q2 of
+   * `STAGE_2_DESIGN_DECISIONS.md`: store the raw namespaced form;
+   * render display-name + friendly name on the fly. Per-turn workspace
+   * attribution lives here on each call's name, NOT on a top-level
+   * `ChatResult.workspaceId` field (removed by T006 — different tool
+   * calls in the same turn can land in different workspaces, so a
+   * single result-level workspaceId would be misleading).
+   */
   toolCalls: Array<{
     id: string;
     name: string;

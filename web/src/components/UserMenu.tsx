@@ -1,13 +1,15 @@
-import { ChevronUp, LogOut, UserCog } from "lucide-react";
+import { Building2, ChevronUp, LogOut, UserCog } from "lucide-react";
 import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useSession } from "../context/SessionContext";
+import { roleAtLeast, useScopedRole } from "../hooks/useScopedRole";
 import { cn } from "../lib/utils";
 
 // ---------------------------------------------------------------------------
-// Avatar palette — same hues as WorkspaceSelector for consistency, but the
-// user gets a different deterministic index (hashed from email/id, not
-// workspace name) so the colors don't clash with the active workspace.
+// Avatar palette. The user gets a deterministic index hashed from
+// email/id; T013's sidebar workspace+apps navigator will adopt the same
+// palette so workspace + identity avatars stay visually consistent
+// without colliding (different hash inputs → different hues).
 // ---------------------------------------------------------------------------
 
 const AVATAR_PALETTE: [string, string][] = [
@@ -45,20 +47,34 @@ function initials(displayName: string, email: string): string {
 interface UserMenuProps {
   collapsed: boolean;
   onLogout: () => void;
+  /**
+   * Direction the dropdown opens relative to its trigger. `"down"` for
+   * top-anchored placements (current sidebar layout); `"up"` for
+   * legacy bottom-anchored callers. Defaults to `"down"`.
+   */
+  dropdownDirection?: "up" | "down";
 }
 
 /**
- * Identity-bound menu pinned to the bottom of the shell sidebar.
+ * Identity-bound menu at the top-left of the shell sidebar.
  *
- * Sits below the workspace switcher (which is workspace-bound) — the two
- * are deliberate peers: workspace context at top (changes per session
- * activity), identity context at bottom (constant across the session).
- * Click reveals a popover with profile settings and sign out — the user's
+ * Identity sits at the top as a constant-across-session anchor; the
+ * workspace+apps navigator (T013) sits below it. Click reveals a
+ * popover with profile settings and sign out — the user's
  * always-available account surface, regardless of which page they're on.
+ *
+ * `dropdownDirection` toggles whether the popover opens below
+ * (top-anchored — default) or above (bottom-anchored — kept for any
+ * legacy mount points).
  */
-export const UserMenu = memo(function UserMenu({ collapsed, onLogout }: UserMenuProps) {
+export const UserMenu = memo(function UserMenu({
+  collapsed,
+  onLogout,
+  dropdownDirection = "down",
+}: UserMenuProps) {
   const session = useSession();
   const navigate = useNavigate();
+  const isOrgAdmin = roleAtLeast(useScopedRole(), "org_admin");
   const [open, setOpen] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
 
@@ -85,6 +101,11 @@ export const UserMenu = memo(function UserMenu({ collapsed, onLogout }: UserMenu
   const goToProfile = useCallback(() => {
     setOpen(false);
     navigate("/profile");
+  }, [navigate]);
+
+  const goToOrgSettings = useCallback(() => {
+    setOpen(false);
+    navigate("/org");
   }, [navigate]);
 
   const handleLogout = useCallback(() => {
@@ -151,8 +172,11 @@ export const UserMenu = memo(function UserMenu({ collapsed, onLogout }: UserMenu
           className={cn(
             "absolute z-50 rounded-lg border border-sidebar-border bg-sidebar shadow-lg ws-dropdown-enter",
             collapsed
-              ? "left-full bottom-0 ml-2 w-56"
-              : "left-0 right-0 bottom-full mb-1 w-full min-w-[200px]",
+              ? cn("left-full ml-2 w-56", dropdownDirection === "up" ? "bottom-0" : "top-0")
+              : cn(
+                  "left-0 right-0 w-full min-w-[200px]",
+                  dropdownDirection === "up" ? "bottom-full mb-1" : "top-full mt-1",
+                ),
           )}
         >
           {/* Identity header (collapsed only — expanded already shows it in the trigger) */}
@@ -173,6 +197,16 @@ export const UserMenu = memo(function UserMenu({ collapsed, onLogout }: UserMenu
               <UserCog className="w-4 h-4 text-sidebar-foreground/60" />
               <span>Profile settings</span>
             </button>
+            {isOrgAdmin && (
+              <button
+                type="button"
+                onClick={goToOrgSettings}
+                className="flex items-center gap-2.5 w-full rounded-md px-2 py-2 text-sm text-left transition-all duration-150 text-sidebar-foreground hover:bg-sidebar-foreground/5"
+              >
+                <Building2 className="w-4 h-4 text-sidebar-foreground/60" />
+                <span>Organization</span>
+              </button>
+            )}
             <button
               type="button"
               onClick={handleLogout}

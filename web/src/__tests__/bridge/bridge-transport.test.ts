@@ -74,6 +74,25 @@ const mcpRequest = mock((req: { method: string; params: unknown }, schema: unkno
 
 let getClientShouldReject: Error | null = null;
 const getClientCalls = { count: 0 };
+// The bridge now namespaces tool names with `ws_<active>-` before
+// dispatching (Q3 auto-prefix). Mock `getActiveWorkspaceId` to return
+// a stable workspace id so the wire-name assertions below are
+// deterministic.
+// Spread the real module so this whole-module mock exposes every api/client
+// export. Bun's `mock.module` is process-global; a partial stub leaking into
+// another suite mid-run (under CI's parallelism) is what crashed these bridge
+// tests with "Export named 'getActiveWorkspaceId' not found". A complete mock
+// is inert when it leaks — only the two below are overridden.
+const actualClient = await import("../../api/client");
+mock.module("../../api/client", () => ({
+  ...actualClient,
+  getActiveWorkspaceId: () => "ws_test",
+  // Keep upload benign for this transport test (no upload triggered here).
+  uploadResource: async () => {
+    throw new Error("uploadResource not stubbed in this test");
+  },
+}));
+
 mock.module("../../mcp-bridge-client", () => ({
   getMcpBridgeClient: async () => {
     getClientCalls.count += 1;
@@ -234,10 +253,12 @@ describe("tools/call — MCP transport", () => {
     expect(reply.result.structuredContent).toEqual({ via: "mcp" });
     expect(mcpCallTool).toHaveBeenCalledTimes(1);
 
-    // The wire name is qualified with the app's own server per REST-parity.
+    // The wire name is namespaced with the active workspace (Q3
+    // auto-prefix) and qualified with the app's own server per
+    // REST-parity. Mock `getActiveWorkspaceId` returns `ws_test`.
     const [callParams] = mcpCallTool.mock.calls[0] ?? [];
     expect(callParams).toEqual({
-      name: "synapse-research__search",
+      name: "ws_test-synapse-research__search",
       arguments: { q: "mcp" },
     });
   });
@@ -333,7 +354,7 @@ describe("tools/call — INTERNAL_APPS authz", () => {
     // NOT "nb" — the authz rule rejects the cross-call attempt.
     expect(mcpCallTool).toHaveBeenCalledTimes(1);
     const [callParams] = mcpCallTool.mock.calls[0] ?? [];
-    expect((callParams as { name: string }).name).toBe("synapse-research__t");
+    expect((callParams as { name: string }).name).toBe("ws_test-synapse-research__t");
   });
 
   test("internal app with params.server is allowed to cross-call", async () => {
@@ -349,7 +370,7 @@ describe("tools/call — INTERNAL_APPS authz", () => {
 
     expect(mcpCallTool).toHaveBeenCalledTimes(1);
     const [callParams] = mcpCallTool.mock.calls[0] ?? [];
-    expect((callParams as { name: string }).name).toBe("home__briefing");
+    expect((callParams as { name: string }).name).toBe("ws_test-home__briefing");
   });
 });
 

@@ -14,16 +14,22 @@ import {
   ConversationCorruptedError,
   RunInProgressError,
 } from "../runtime/errors.ts";
-import { type RequestContext, runWithRequestContext } from "../runtime/request-context.ts";
+import {
+  type RequestContext,
+  type RequestScope,
+  runWithRequestContext,
+} from "../runtime/request-context.ts";
 import type { Runtime } from "../runtime/runtime.ts";
 import type { ChatRequest } from "../runtime/types.ts";
 import { coerceInputForSchema } from "../tools/coerce-input.ts";
 import type { HealthMonitor } from "../tools/health-monitor.ts";
-import type { ResourceData } from "../tools/types.ts";
+import type { ToolRegistry } from "../tools/registry.ts";
+import type { ResourceData, ToolSource } from "../tools/types.ts";
 import { validateToolInput } from "../tools/validate-input.ts";
 import { estimateCost } from "../usage/cost.ts";
 import { bytesToBase64 } from "../util/base64.ts";
 import { PersonalWorkspaceInvariantError } from "../workspace/errors.ts";
+import { personalWorkspaceIdFor } from "../workspace/workspace-store.ts";
 import type { ConversationEventManager } from "./conversation-events.ts";
 import type { SseEventManager } from "./events.ts";
 import { ChatRequestBody, ToolCallRequestEnvelope } from "./schemas/rest.ts";
@@ -68,24 +74,33 @@ export async function handleChat(
   const originSubscriberId = request.headers.get("x-origin-subscriber-id") ?? undefined;
 
   try {
-    // Thread the request's abort signal into the chat so a client
-    // disconnect or upstream timeout actually cancels the in-flight
-    // engine loop and tool calls — instead of orphaning the work until
-    // it eventually finishes writing to disk (the production bug behind
-    // the morning-brief executor lying about timeouts).
-    const result = await runtime.chat({ ...parsed, signal: request.signal });
+    // The run is owned by the runtime, not by this HTTP request — we do
+    // NOT pass `request.signal`. A client disconnect (mobile screen-lock,
+    // backgrounded tab, network blip) must not cancel the in-flight
+    // engine loop; the run completes server-side, persists, and is
+    // replayed to any reconnecting /v1/conversations/:id/events
+    // subscriber. See the detached `.chat(parsed, sink)` in
+    // handleChatStream for the full rationale (PR #251 regression). The
+    // automations executor's deadline cancellation is unaffected — that
+    // path supplies its own AbortController.
+    const result = await runtime.chat(parsed);
     // Cost is derived at the boundary, never stored. Same wire shape as
     // the streaming `done` event so clients see one consistent contract.
     const wireUsage = {
       ...result.usage,
       costUsd: estimateCost(result.usage.model, result.usage),
     };
+    // Stage 2: chat is identity-bound, so there is no `ChatResult.workspaceId`
+    // — per-tool-call workspace attribution lives on each `tool.done` event's
+    // `workspaceId` field (stamped from the orchestrator's resolved
+    // namespace), not on the response envelope. (`ChatRequest.workspaceId`
+    // exists as the focused workspace for prompt scoping, but it's an input,
+    // not part of the result.)
     const responseBody = {
       ...result,
       inputTokens: result.usage.inputTokens,
       outputTokens: result.usage.outputTokens,
       usage: wireUsage,
-      ...(parsed.workspaceId ? { workspaceId: parsed.workspaceId } : {}),
     };
 
     // Same-user cross-tab broadcast — parity with /v1/chat/stream. A
@@ -311,28 +326,41 @@ export async function handleChatStream(
   const convId = parsed.conversationId;
 
   const sink = new CallbackEventSink();
-  let markClosed: () => void;
+  // This HTTP stream is a detachable *observer* of the run, not its
+  // owner. `markTransportClosed` lets the stream's cancel() (client
+  // disconnect) stop writing to this response without touching the run.
+  let markTransportClosed: () => void = () => {};
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
       const encoder = new TextEncoder();
-      let closed = false;
+      // Tracks whether THIS response is still writable. It does not track
+      // the run — the run's lifecycle is the sink subscription, torn down
+      // in `endRun()` when the run actually ends (see the .chat() call).
+      let transportOpen = true;
       // Keep the TCP connection alive during slow tool calls (Typst
       // compile, MCP task-augmented research) — ALB idle-timeout kills
-      // silent streams. Must be created before `markClosed` captures it.
+      // silent streams. Must be created before `markTransportClosed`
+      // captures it.
       const heartbeat = startSseHeartbeat(controller, HEARTBEAT_INTERVAL_MS);
-      markClosed = () => {
-        closed = true;
+      markTransportClosed = () => {
+        if (!transportOpen) return;
+        transportOpen = false;
         heartbeat.stop();
       };
+      // Write to this response. No-op once the client has detached — the
+      // run keeps producing events, which still reach other observers via
+      // the broadcast below and the persisted conversation.
       const send = (event: string, data: unknown) => {
-        if (closed) return;
+        if (!transportOpen) return;
         controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
       };
-      const finish = () => {
-        if (closed) return;
-        closed = true;
+      // Close this response's stream (run finished while the client was
+      // still connected — the happy path). If the client already left,
+      // this is a no-op; the controller is already torn down by cancel().
+      const closeTransport = () => {
+        if (!transportOpen) return;
+        transportOpen = false;
         heartbeat.stop();
-        unsubscribe();
         controller.close();
       };
 
@@ -396,12 +424,28 @@ export async function handleChatStream(
         }
       });
 
+      // Called exactly once when the run terminates (success or error),
+      // independent of transport state. Releasing the sink subscription
+      // here — not on client disconnect — is what lets a run finish in
+      // the background after the phone locks or the tab is backgrounded.
+      const endRun = () => {
+        unsubscribe();
+        closeTransport();
+      };
+
       runtime
-        // Thread the HTTP request's signal so client disconnect cancels
-        // the engine loop + in-flight tool calls (cooperative). The SSE
-        // stream's controller closes on cancellation via `closed` flag;
-        // this propagates the cancellation INTO the chat too.
-        .chat({ ...parsed, signal: request.signal }, sink)
+        // The run is deliberately NOT bound to this HTTP request: we do
+        // not pass `request.signal`. A client disconnect closes the
+        // stream (cancel() → markTransportClosed) but must not cancel the
+        // engine loop. The run completes server-side, persists to the
+        // conversation store, and replays to any reconnecting
+        // /v1/conversations/:id/events subscriber — the "leave and come
+        // back" contract. PR #251 bound the run to the connection and
+        // silently abandoned prompts the moment a mobile client dropped
+        // (run.error "The connection was closed"). The one caller that
+        // must cancel on a deadline — the automations executor — owns its
+        // own AbortController in bundles/automations/src/executor.ts.
+        .chat(parsed, sink)
         .then((result) => {
           // Cost is computed at the API boundary — never stored. The
           // wire-format `usage.costUsd` is what clients display; deriving
@@ -411,10 +455,13 @@ export async function handleChatStream(
             ...result.usage,
             costUsd: estimateCost(result.usage.model, result.usage),
           };
+          // Stage 2 (T006): no `workspaceId` on the chat-level done
+          // envelope — per-tool-call attribution lives on each
+          // `tool.done` event's payload above. See `ChatResult`'s
+          // doc comment for the rationale.
           const doneData = {
             response: result.response,
             conversationId: result.conversationId,
-            ...(parsed.workspaceId ? { workspaceId: parsed.workspaceId } : {}),
             skillName: result.skillName,
             toolCalls: result.toolCalls,
             inputTokens: result.usage.inputTokens,
@@ -436,7 +483,7 @@ export async function handleChatStream(
               );
             }
           }
-          finish();
+          endRun();
         })
         .catch((err) => {
           if (err instanceof RunInProgressError) {
@@ -444,7 +491,7 @@ export async function handleChatStream(
               error: "run_in_progress",
               message: "This conversation already has an active response.",
             });
-            finish();
+            endRun();
             return;
           }
           if (err instanceof ConversationAccessDeniedError) {
@@ -452,7 +499,7 @@ export async function handleChatStream(
               error: "conversation_access_denied",
               message: "You do not have access to this conversation.",
             });
-            finish();
+            endRun();
             return;
           }
           if (err instanceof ConversationCorruptedError) {
@@ -460,7 +507,7 @@ export async function handleChatStream(
               error: "conversation_corrupted",
               message: err.message,
             });
-            finish();
+            endRun();
             return;
           }
           console.error("[routes] handleChatStream failed:", err);
@@ -470,11 +517,13 @@ export async function handleChatStream(
             error: friendly.code,
             message: friendly.message,
           });
-          finish();
+          endRun();
         });
     },
     cancel() {
-      markClosed();
+      // The client went away (disconnect / phone lock / tab close).
+      // Detach this observer ONLY — the run continues to completion.
+      markTransportClosed();
     },
   });
 
@@ -548,20 +597,8 @@ export async function handleResourceProxy(
   runtime: Runtime,
   workspaceId?: string,
 ): Promise<Response> {
-  // Workspace authorization — reject requests for servers not in the active workspace
-  if (workspaceId) {
-    const wsRegistry = await runtime.ensureWorkspaceRegistry(workspaceId);
-    if (!wsRegistry.hasSource(appName)) {
-      return apiError(
-        403,
-        "workspace_access_denied",
-        `App "${appName}" is not available in this workspace`,
-        { app: appName },
-      );
-    }
-  }
-
-  // Dev mode: redirect to local Vite dev server when --app flag is active
+  // Dev mode: redirect to local Vite dev server when --app flag is active.
+  // Applies to both identity and workspace apps, so it runs first.
   const { isDevMode, getAppDevUrl } = await import("../runtime/dev-registry.ts");
   if (isDevMode(appName)) {
     const devUrl = getAppDevUrl(appName)!;
@@ -569,12 +606,46 @@ export async function handleResourceProxy(
     return Response.redirect(`${devUrl}${target}`, 302);
   }
 
-  // Both platform built-ins and user-installed bundles are now MCP servers
-  // (in-process or subprocess); both go through the same `readAppResource`
-  // path. The only branch is for "primary" → resourceUri resolution, which
-  // platform sources expose via the source's mode metadata while external
-  // bundles expose via their `instance.ui.placements`.
-  if (!workspaceId) throw new Error("Workspace ID required");
+  // Identity apps (conversations, …) live OUTSIDE any workspace. They are
+  // authorized by the authenticated session (requireAuth already ran on this
+  // route) and read from the kernel identity source — never a workspace
+  // registry. A stale `X-Workspace-Id` (the last active workspace the shell
+  // sent) is ignored: location is scope, and an identity app has no workspace
+  // location to authorize against.
+  const identitySource = runtime.getIdentitySource(appName);
+  if (identitySource) {
+    let resolvedPath = resourcePath;
+    if (resourcePath === "primary") {
+      const primaryUri = resolveSourcePrimaryResourceUri(identitySource);
+      if (primaryUri) resolvedPath = primaryUri.replace(/^ui:\/\//, "");
+    }
+    const resource = await runtime.readIdentityAppResource(appName, resolvedPath);
+    if (resource === null) {
+      return apiError(404, "resource_not_found", `Resource "ui://${resourcePath}" not found`, {
+        resource: `ui://${resourcePath}`,
+      });
+    }
+    return json({ contents: [buildResourceEnvelopeEntry(`ui://${resolvedPath}`, resource)] });
+  }
+
+  // Workspace apps — require a workspace and authorize membership. Both
+  // platform built-ins and user-installed bundles are MCP servers reachable
+  // through the workspace registry; registry membership is the authoritative
+  // "is this app available to this workspace?" check.
+  if (!workspaceId) {
+    return apiError(400, "workspace_required", `App "${appName}" requires a workspace`, {
+      app: appName,
+    });
+  }
+  const wsRegistry = await runtime.ensureWorkspaceRegistry(workspaceId);
+  if (!wsRegistry.hasSource(appName)) {
+    return apiError(
+      403,
+      "workspace_access_denied",
+      `App "${appName}" is not available in this workspace`,
+      { app: appName },
+    );
+  }
 
   let resolvedPath = resourcePath;
   if (resourcePath === "primary") {
@@ -624,8 +695,19 @@ async function resolvePrimaryResourceUri(
 
   const registry = await runtime.ensureWorkspaceRegistry(workspaceId);
   const source = registry.getSources().find((s) => s.name === appName);
-  if (!source) return null;
-  const fn = (source as { getPlacements?: () => unknown }).getPlacements;
+  return resolveSourcePrimaryResourceUri(source);
+}
+
+/**
+ * Resolve a source's "primary" `resourceUri` by scanning the placements it
+ * declares via `getPlacements()` (the in-process `McpSource` duck-type). Used
+ * directly by the identity-app host (no workspace, no lifecycle instance) and
+ * as the fallback tier of {@link resolvePrimaryResourceUri} for workspace
+ * apps. Returns `null` when the source declares no placement with a
+ * `resourceUri`.
+ */
+function resolveSourcePrimaryResourceUri(source: unknown): string | null {
+  const fn = (source as { getPlacements?: () => unknown } | undefined)?.getPlacements;
   if (typeof fn !== "function") return null;
   const placements = fn.call(source);
   if (!Array.isArray(placements)) return null;
@@ -714,9 +796,7 @@ export async function handleReadResource(
   // catches the exception, returning null → 404 to the caller.
   const reqCtx: RequestContext = {
     identity: null,
-    workspaceId,
-    workspaceAgents: null,
-    workspaceModelOverride: null,
+    scope: { kind: "workspace", workspaceId, workspaceAgents: null, workspaceModelOverride: null },
   };
   const resource = await runWithRequestContext(reqCtx, () =>
     runtime.readAppResource(server, uri, workspaceId),
@@ -762,29 +842,48 @@ export async function handleToolCall(
 
   const { sseManager, eventSink, identity, workspaceId } = options ?? {};
 
-  // Resolve registry: workspace-scoped when available, global otherwise
-  if (!workspaceId) throw new Error("Workspace ID required");
-  const registry = await runtime.ensureWorkspaceRegistry(workspaceId);
-
-  // Check if server exists
-  if (!registry.hasSource(server)) {
-    return apiError(404, "tool_not_found", `Tool "${tool}" not found on server "${server}"`, {
-      server,
-      tool,
-    });
+  // Resolve the source through the two doors — the same decision the
+  // orchestrator makes for `/mcp` (`routeToolCall`). Identity sources
+  // (conversations, …) are owned by the user and live OUTSIDE any workspace:
+  // they resolve from the identity-source set and dispatch with identity
+  // scope, regardless of any (stale) X-Workspace-Id. Everything else resolves
+  // through the workspace registry and keeps its per-workspace permission
+  // gating on execute. Without this, a REST call to an identity source 404s
+  // ("not found on server") because the workspace registry no longer holds it.
+  const identitySource = runtime.getIdentitySource(server);
+  let workspaceRegistry: ToolRegistry | undefined;
+  let source: ToolSource | undefined;
+  let scope: RequestScope;
+  if (identitySource) {
+    source = identitySource;
+    scope = { kind: "identity" };
+  } else {
+    if (!workspaceId) {
+      return apiError(400, "workspace_required", `Tool "${tool}" requires a workspace`, {
+        server,
+        tool,
+      });
+    }
+    workspaceRegistry = await runtime.ensureWorkspaceRegistry(workspaceId);
+    if (!workspaceRegistry.hasSource(server)) {
+      return apiError(404, "tool_not_found", `Tool "${tool}" not found on server "${server}"`, {
+        server,
+        tool,
+      });
+    }
+    source = workspaceRegistry.getSources().find((s) => s.name === server);
+    scope = { kind: "workspace", workspaceId, workspaceAgents: null, workspaceModelOverride: null };
   }
 
-  // Check if tool exists on the server
-  // The tool name may already be prefixed (e.g., "home__briefing" from the bridge)
-  // or bare (e.g., "briefing"). Normalize to full name.
+  // The tool name may already be prefixed (e.g., "home__briefing" from the
+  // bridge) or bare (e.g., "briefing"). Normalize to the full name.
   const toolName = tool.startsWith(`${server}__`) ? tool : `${server}__${tool}`;
 
-  // Coerced args flow through to registry.execute below — validation and
-  // execution must see the same shape. Defaults to the raw args; replaced
-  // with the schema-coerced version once we resolve the tool definition.
+  // Coerced args flow through to execute below — validation and execution must
+  // see the same shape. Defaults to the raw args; replaced with the
+  // schema-coerced version once we resolve the tool definition.
   let coercedArgs: Record<string, unknown> = args ?? {};
 
-  const source = registry.getSources().find((s) => s.name === server);
   if (source) {
     try {
       const tools = await source.tools();
@@ -833,12 +932,12 @@ export async function handleToolCall(
     });
   }
 
-  // Build per-request context for AsyncLocalStorage (concurrency-safe)
+  // Build per-request context for AsyncLocalStorage (concurrency-safe). The
+  // scope is the resolved door — identity for a kernel identity source,
+  // workspace otherwise — never a nullable workspace.
   const reqCtx: RequestContext = {
     identity: identity ?? null,
-    workspaceId: workspaceId ?? null,
-    workspaceAgents: null,
-    workspaceModelOverride: null,
+    scope,
   };
 
   // Audit log
@@ -853,30 +952,32 @@ export async function handleToolCall(
       id: callId,
       server,
       userId: identity?.id ?? null,
-      workspaceId: workspaceId ?? null,
+      workspaceId: scope.kind === "workspace" ? scope.workspaceId : null,
     },
   };
   sseManager?.emit(bridgeCallEvent);
   eventSink?.emit(bridgeCallEvent);
 
   const t0 = performance.now();
-  let result: Awaited<ReturnType<typeof registry.execute>> | undefined;
+  let result: Awaited<ReturnType<ToolRegistry["execute"]>> | undefined;
   try {
-    // Thread the calling member's identity to the registry so member-
-    // scoped MCP bundles route to the right per-principal source.
-    // Workspace-scoped sources ignore principalId entirely.
-    const principalId = identity?.id;
-    result = await runWithRequestContext(reqCtx, () =>
-      registry.execute(
-        {
-          id: callId,
-          name: toolName,
-          input: coercedArgs,
-        },
-        undefined,
-        principalId,
-      ),
-    );
+    // Identity flows through AsyncLocalStorage via `reqCtx`. Sources that
+    // need the caller's identity read it from `getRequestContext()`.
+    //
+    // Workspace tools dispatch through the registry (which applies the
+    // per-workspace permission gating wired via `setPermissionContext`).
+    // Identity tools have no workspace registry — dispatch straight to the
+    // source with the bare tool name (owner-gated in the handler), mirroring
+    // the `/mcp` identity branch.
+    result = await runWithRequestContext(reqCtx, () => {
+      if (identitySource) {
+        return identitySource.execute(toolName.slice(toolName.indexOf("__") + 2), coercedArgs);
+      }
+      // A non-identity source always resolved a workspace registry above (or
+      // we 400'd); the guard narrows the type without a non-null assertion.
+      if (!workspaceRegistry) throw new Error("workspace registry missing for workspace tool");
+      return workspaceRegistry.execute({ id: callId, name: toolName, input: coercedArgs });
+    });
   } catch (err) {
     const ms = Math.round(performance.now() - t0);
     const failEvent = {
@@ -887,7 +988,7 @@ export async function handleToolCall(
         ok: false,
         ms,
         userId: identity?.id ?? null,
-        workspaceId: workspaceId ?? null,
+        workspaceId: scope.kind === "workspace" ? scope.workspaceId : null,
       },
     };
     sseManager?.emit(failEvent);
@@ -936,7 +1037,7 @@ export async function handleToolCall(
       ok: !result.isError,
       ms,
       userId: identity?.id ?? null,
-      workspaceId: workspaceId ?? null,
+      workspaceId: scope.kind === "workspace" ? scope.workspaceId : null,
     },
   };
   sseManager?.emit(doneEvent);
@@ -983,25 +1084,14 @@ export async function handleBootstrap(
     );
   }
 
-  // 2. Resolve active workspace — permissive: honor X-Workspace-Id when it
-  // matches a membership, otherwise pick the first. Bootstrap is the one
-  // place the server defaults, because it's the only place a client can
-  // legitimately not yet know a wsId. On data endpoints the same header is
-  // authoritative (unknown wsId → 400); bootstrap is the discovery surface
-  // so the contract is weaker here by design.
-  const requested = req.headers.get("X-Workspace-Id");
-  const activeWorkspace: string =
-    requested && userWorkspaces.some((ws) => ws.id === requested)
-      ? requested
-      : userWorkspaces[0]!.id;
-
-  // 3. Identify the user's personal workspace. Stage 1 invariant:
+  // 2. Identify the user's personal workspace. Stage 1 invariant:
   //    every user has exactly one personal workspace where
   //    `isPersonal === true && ownerUserId === identity.id`. If for any
   //    reason there are multiple (data corruption — shouldn't happen),
   //    pick the earliest-created and log a warning so operators notice.
   //    If there are zero (pre-migration deployment), `personalWorkspaceId`
-  //    is `null` — the UI can fall back to `activeWorkspace`.
+  //    is `null` — the active-workspace fallback below uses the first
+  //    membership instead.
   const personalCandidates = userWorkspaces.filter(
     (ws) => ws.isPersonal === true && ws.ownerUserId === identity.id,
   );
@@ -1032,6 +1122,21 @@ export async function handleBootstrap(
         `Run \`bun run migrate:personal-workspaces\` or trigger a re-login.`,
     );
   }
+
+  // 3. Resolve the active (focused) workspace. The single source of truth
+  // for "which workspace am I in" is the client's URL (`/w/:slug`); the
+  // web shell no longer persists or sends a remembered selection. Bootstrap
+  // therefore just provides a sane default focus for workspace-agnostic
+  // routes (home, conversations): the user's personal workspace, falling
+  // back to the first membership pre-migration. `X-Workspace-Id` is still
+  // honored when present and valid (e.g. a deep-link cold-load) but is no
+  // longer required — its absence is the normal case, not an error. On data
+  // endpoints the same header remains authoritative (unknown wsId → 400).
+  const requested = req.headers.get("X-Workspace-Id");
+  const activeWorkspace: string =
+    requested && userWorkspaces.some((ws) => ws.id === requested)
+      ? requested
+      : (personalWorkspaceId ?? userWorkspaces[0]!.id);
 
   // 4. Shell placements for the active workspace (ambient + scoped, merged).
   const placements = runtime.getPlacementRegistry().forWorkspace(activeWorkspace);
@@ -1418,17 +1523,19 @@ async function parseChatBody(
   }
   const parsed = body as ChatRequestBody;
 
-  // Middleware-resolved workspace takes precedence over body field
-  const resolvedWorkspaceId = workspaceId ?? parsed.workspaceId;
+  // The validated `X-Workspace-Id` (focused workspace) threads into
+  // `ChatRequest.workspaceId`: it drives the deterministic per-workspace
+  // briefing (apps + overlays), NOT the tool list (still the identity's
+  // cross-workspace union). See the `ChatRequest.workspaceId` doc comment.
 
   return {
     message: parsed.message,
     ...(parsed.conversationId !== undefined ? { conversationId: parsed.conversationId } : {}),
     ...(parsed.model !== undefined ? { model: parsed.model } : {}),
-    ...(resolvedWorkspaceId ? { workspaceId: resolvedWorkspaceId } : {}),
     ...(parsed.appContext !== undefined ? { appContext: parsed.appContext } : {}),
     ...(parsed.metadata !== undefined ? { metadata: parsed.metadata } : {}),
     ...(parsed.allowedTools !== undefined ? { allowedTools: parsed.allowedTools } : {}),
+    ...(workspaceId !== undefined ? { workspaceId } : {}),
     ...(identity ? { identity } : {}),
   };
 }
@@ -1491,21 +1598,32 @@ async function parseMultipartChatBody(
     return apiError(400, "bad_request", "message or file attachment is required");
   }
 
-  // If no files, treat as a plain text request (no ingest needed)
+  // If no files, treat as a plain text request (no ingest needed). The
+  // focused workspace (`X-Workspace-Id`) threads into `ChatRequest.workspaceId`
+  // for prompt scoping — see `parseChatBody`.
   if (uploadedFiles.length === 0) {
     return {
       message,
       conversationId: typeof conversationId === "string" ? conversationId : undefined,
       model: typeof model === "string" ? model : undefined,
       appContext,
-      ...(workspaceId ? { workspaceId } : {}),
+      ...(workspaceId !== undefined ? { workspaceId } : {}),
       ...(identity ? { identity } : {}),
     };
   }
 
   // Ingest files: validate, store, extract text, build content parts.
-  // Files MUST be workspace-scoped so the files__* tools can find them.
-  const store = createFileStore(join(runtime.getWorkspaceScopedDir(workspaceId), "files"));
+  //
+  // Stage 2: the file store is identity-bound. `runtime.chat()` reads files
+  // from `getWorkspaceScopedDir(personalWorkspaceIdFor(identity.id))/files`;
+  // ingest writes to the SAME location here, ignoring `X-Workspace-Id` for
+  // FILE STORAGE (files are identity-scoped — Phase B moves them fully). The
+  // `workspaceId` parameter still threads into `ChatRequest.workspaceId` (the
+  // focused workspace, for prompt scoping) — it just doesn't route file
+  // storage. Cross-workspace ingest is a later concern (files would need to
+  // be tagged with their target workspace at upload).
+  const ingestWsId = identity?.id ? personalWorkspaceIdFor(identity.id) : workspaceId;
+  const store = createFileStore(join(runtime.getWorkspaceScopedDir(ingestWsId), "files"));
   const filesConfig = runtime.getFilesConfig();
   // Use conversationId if provided, otherwise a placeholder (will be replaced by runtime.chat)
   const convId = (typeof conversationId === "string" && conversationId) || "pending";
@@ -1516,7 +1634,6 @@ async function parseMultipartChatBody(
       errors: ingestResult.errors,
     });
   }
-
   return {
     message,
     conversationId: typeof conversationId === "string" ? conversationId : undefined,
@@ -1524,7 +1641,7 @@ async function parseMultipartChatBody(
     appContext,
     contentParts: ingestResult.contentParts,
     fileRefs: ingestResult.fileRefs,
-    ...(workspaceId ? { workspaceId } : {}),
+    ...(workspaceId !== undefined ? { workspaceId } : {}),
     ...(identity ? { identity } : {}),
   };
 }

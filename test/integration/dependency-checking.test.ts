@@ -21,7 +21,7 @@ function createCapturingModel(): { model: LanguageModelV3; getSystem: () => stri
     const systemMsg = options.prompt.find((m) => m.role === "system");
     if (systemMsg && typeof systemMsg.content === "string") {
       // Skip auto-title calls (they have a short, distinctive system prompt)
-      if (!systemMsg.content.includes("descriptive titles for conversations")) {
+      if (!systemMsg.content.includes("Generate a 3-6 word title")) {
         capturedSystem = systemMsg.content;
       }
     }
@@ -152,7 +152,7 @@ You are a data analyst.
     expect(getSystem()).toContain("You are a data analyst");
     expect(getSystem()).toContain("Missing dependencies");
     expect(getSystem()).toContain("@acme/data-tools");
-    expect(getSystem()).toContain("nb__manage_app");
+    expect(getSystem()).toContain("Apps catalog in settings");
 
     await runtime.shutdown();
   });

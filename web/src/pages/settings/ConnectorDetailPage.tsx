@@ -34,13 +34,14 @@ import { roleAtLeast, useScopedRole } from "../../hooks/useScopedRole";
  *     setup is past.
  *
  * Reachable from `/settings/{personal,workspace}/connectors/:serverName`;
- * scope comes from the route prefix.
+ * `mode` comes from the route prefix.
  */
-export function ConnectorDetailPage({ scope }: { scope: "user" | "workspace" }) {
-  const { serverName = "" } = useParams<{ serverName: string }>();
+export function ConnectorDetailPage({ mode }: { mode: "personal" | "workspace" }) {
+  const { serverName = "", slug } = useParams<{ serverName: string; slug: string }>();
   const navigate = useNavigate();
-  const backPath =
-    scope === "user" ? "/settings/personal/connectors" : "/settings/workspace/connectors";
+  // Workspace connectors are addressed by the URL slug. (Personal-scope
+  // connectors have no UI surface today; the mode is kept for the API.)
+  const backPath = `/w/${slug}/settings/connectors`;
 
   const [installed, setInstalled] = useState<InstalledConnector | null>(null);
   const [loading, setLoading] = useState(true);
@@ -54,18 +55,19 @@ export function ConnectorDetailPage({ scope }: { scope: "user" | "workspace" }) 
   const [uninstallArmed, setUninstallArmed] = useState(false);
 
   const role = useScopedRole();
-  // Workspace-scope edit gates ride on ws_admin. User-scope (personal
-  // connectors) is always editable by the owner — it's their account.
-  const canManage = scope === "user" ? true : roleAtLeast(role, "ws_admin");
+  // Workspace-mode edit gates ride on ws_admin. Personal-mode is
+  // always editable by the owner — it's their personal workspace, and
+  // the workspace store enforces sole-owner membership invariants.
+  const canManage = mode === "personal" ? true : roleAtLeast(role, "ws_admin");
 
   const refresh = useCallback(async () => {
     setError(null);
     try {
       // Targeted single-connector fetch — avoids building entries
       // (and tools() round-trips) for every other installed bundle
-      // when we only render one. Note: scope is unused here; the
-      // server resolves scope from the serverName lookup, falling
-      // back to whichever scope the bundle is installed under.
+      // when we only render one. Server resolves the connector from
+      // serverName; the page `mode` is a UI affordance, not a server
+      // arg.
       const res = await getInstalledConnector(serverName);
       setInstalled(res.installed);
     } catch (err) {
@@ -91,7 +93,7 @@ export function ConnectorDetailPage({ scope }: { scope: "user" | "workspace" }) 
     setActing("uninstall");
     setError(null);
     try {
-      await uninstallConnector(installed.serverName, scope);
+      await uninstallConnector(installed.serverName, "workspace");
       navigate(backPath);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -109,7 +111,7 @@ export function ConnectorDetailPage({ scope }: { scope: "user" | "workspace" }) 
         <Link to={backPath} className="text-xs text-muted-foreground hover:underline">
           ← All connectors
         </Link>
-        <p className="text-sm">Connector "{serverName}" is not installed in this scope.</p>
+        <p className="text-sm">Connector "{serverName}" is not installed.</p>
       </div>
     );
   }
@@ -191,7 +193,7 @@ export function ConnectorDetailPage({ scope }: { scope: "user" | "workspace" }) 
       <div className="space-y-6">
         <OAuthConnectionSection installed={installed} canManage={canManage} onChanged={refresh} />
         <OperatorOAuthSection installed={installed} canManage={canManage} onChanged={refresh} />
-        <ToolPermissionsTable serverName={installed.serverName} scope={scope} />
+        <ToolPermissionsTable serverName={installed.serverName} mode={mode} />
       </div>
 
       {configureModalOpen && (

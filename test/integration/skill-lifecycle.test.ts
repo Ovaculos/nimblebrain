@@ -22,7 +22,7 @@ function createCapturingModel(): { model: LanguageModelV3; getSystem: () => stri
 		const systemMsg = options.prompt.find((m) => m.role === "system");
 		if (systemMsg && typeof systemMsg.content === "string") {
 			// Skip auto-title calls (they have a short, distinctive system prompt)
-			if (!systemMsg.content.includes("descriptive titles for conversations")) {
+			if (!systemMsg.content.includes("Generate a 3-6 word title")) {
 				capturedSystem = systemMsg.content;
 			}
 		}
@@ -43,7 +43,7 @@ async function callTool(
 ): Promise<{ content: string; isError: boolean }> {
 	const registry = runtime.getRegistryForWorkspace(TEST_WORKSPACE_ID);
 	const result = await runWithRequestContext(
-		{ identity: null, workspaceId: TEST_WORKSPACE_ID, workspaceAgents: null, workspaceModelOverride: null },
+		{ identity: null, scope: { kind: "workspace", workspaceId: TEST_WORKSPACE_ID, workspaceAgents: null, workspaceModelOverride: null } },
 		() => registry.execute({
 			id: `test-${Date.now()}`,
 			name: toolName,

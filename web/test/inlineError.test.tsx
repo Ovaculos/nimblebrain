@@ -1,6 +1,7 @@
 import { act, renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it, mock } from "bun:test";
 import type { ReactNode } from "react";
+import { MemoryRouter } from "react-router-dom";
 import { ChatProvider, useChatContext } from "../src/context/ChatContext.tsx";
 
 // ---------------------------------------------------------------------------
@@ -27,7 +28,11 @@ mock.module("../src/api/client", () => ({
 }));
 
 function wrapper({ children }: { children: ReactNode }) {
-  return <ChatProvider>{children}</ChatProvider>;
+  return (
+    <MemoryRouter>
+      <ChatProvider>{children}</ChatProvider>
+    </MemoryRouter>
+  );
 }
 
 let seq = 0;

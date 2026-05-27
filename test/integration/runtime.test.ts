@@ -3,7 +3,7 @@ import { mkdirSync, writeFileSync, rmSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { Runtime } from "../../src/runtime/runtime.ts";
-import { filterTools } from "../../src/runtime/tools.ts";
+import { filterTools } from "../../src/tools/surfacing.ts";
 import { createEchoModel } from "../helpers/echo-model.ts";
 import { createMockModel } from "../helpers/mock-model.ts";
 import type { EngineEvent, EventSink, ToolSchema } from "../../src/engine/types.ts";
@@ -220,7 +220,7 @@ I am Nira, your AI assistant. You work at Acme Corp.
       const systemMsg = options.prompt.find((m) => m.role === "system");
       if (systemMsg && typeof systemMsg.content === "string") {
         // Skip auto-title calls
-        if (!systemMsg.content.includes("descriptive titles for conversations")) {
+        if (!systemMsg.content.includes("Generate a 3-6 word title")) {
           capturedSystem = systemMsg.content;
         }
       }
@@ -331,7 +331,7 @@ Greet with enthusiasm!
     expect(names).toContain("nb__status");
     expect(names).toContain("nb__delegate");
     expect(names).toContain("nb__search");
-    expect(names).toContain("nb__manage_app");
+    expect(names).not.toContain("nb__manage_app");
     // Verify core tools (including internal ones — availableTools returns all)
     expect(names).toContain("nb__set_model_config");
 

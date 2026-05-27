@@ -59,8 +59,19 @@ export interface UseChatReturn {
  * the in-flight response into the destination chat (issue #254). Switching
  * back shows the still-arriving response because the background stream kept
  * filling its origin slice.
+ *
+ * `focusWorkspaceId` is the workspace the chat is FOCUSED on (the `/w/:slug`
+ * the user is viewing). Currently unused on this path — the chat-store
+ * dispatches via `startChatTurn`, which picks up the global active
+ * workspace from `headers()`. Accepted as a param for API compatibility
+ * with the ChatProvider; route-derived focus override is tracked as a
+ * follow-up.
  */
-export function useChat(initialConversationId?: string, currentUserId?: string): UseChatReturn {
+export function useChat(
+  initialConversationId?: string,
+  currentUserId?: string,
+  _focusWorkspaceId?: string | null,
+): UseChatReturn {
   const [activeKey, setActiveKey] = useState(() => {
     const key = initialConversationId ?? freshDraftKey();
     chatStore.ensureSlice(
