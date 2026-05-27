@@ -151,4 +151,57 @@ describe("RunBus", () => {
     expect(typeof detach).toBe("function");
     detach();
   });
+
+  it("caps per-run event buffer and ends the run with a terminal error", () => {
+    // Tiny cap for testability. Production uses 500k.
+    const bus = new RunBus(30_000, 10);
+    const signal = bus.begin("c1");
+
+    const { events, onEvent } = collect();
+    const endStatuses: string[] = [];
+    bus.attach("c1", 0, onEvent, (s) => endStatuses.push(s));
+
+    // Fill exactly to the cap — these should all succeed.
+    for (let i = 0; i < 10; i++) {
+      bus.publish("c1", "text.delta", { text: String(i) });
+    }
+    expect(bus.isActive("c1")).toBe(true);
+
+    // 11th publish trips the cap — turn aborts, terminal error appended.
+    const overflow = bus.publish("c1", "text.delta", { text: "boom" });
+
+    expect(overflow).not.toBeNull();
+    expect(overflow?.type).toBe("error");
+    expect((overflow?.data as { error: string }).error).toBe("buffer_overflow");
+    expect(signal.aborted).toBe(true);
+    expect(bus.getStatus("c1")).toBe("error");
+    expect(bus.isActive("c1")).toBe(false);
+    expect(endStatuses).toEqual(["error"]);
+
+    // The viewer saw 10 deltas + 1 terminal error.
+    expect(events.length).toBe(11);
+    expect(events[events.length - 1]?.type).toBe("error");
+
+    // Further publishes are dropped by the standard not-running guard.
+    const after = bus.publish("c1", "text.delta", { text: "late" });
+    expect(after).toBeNull();
+  });
+
+  it("overflow error event is included in a late attacher's replay", () => {
+    const bus = new RunBus(30_000, 3);
+    bus.begin("c1");
+    bus.publish("c1", "text.delta", { text: "1" });
+    bus.publish("c1", "text.delta", { text: "2" });
+    bus.publish("c1", "text.delta", { text: "3" });
+    bus.publish("c1", "text.delta", { text: "4" }); // trips cap
+
+    const { events, onEvent } = collect();
+    let lateStatus: string | undefined;
+    bus.attach("c1", 0, onEvent, (s) => {
+      lateStatus = s;
+    });
+    expect(lateStatus).toBe("error");
+    expect(events[events.length - 1]?.type).toBe("error");
+    expect((events[events.length - 1]?.data as { error: string }).error).toBe("buffer_overflow");
+  });
 });

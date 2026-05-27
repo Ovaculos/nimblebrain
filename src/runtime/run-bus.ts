@@ -43,7 +43,26 @@ interface RunLog {
   eventListeners: Set<(e: BufferedRunEvent) => void>;
   endListeners: Set<(s: RunStatus) => void>;
   gcTimer?: ReturnType<typeof setTimeout>;
+  /** Set once when the per-run event cap is exceeded, so the overflow
+   *  handler only fires once per run (subsequent publishes during the
+   *  same tick are dropped silently). */
+  bufferOverflowed?: boolean;
 }
+
+/**
+ * Hard cap on buffered events per run. A defense against a runaway or
+ * adversarial event producer holding unbounded memory for the grace window.
+ *
+ * Sized to sit comfortably above legitimate worst cases: a Synapse-research
+ * style extended-thinking turn emits on the order of 10^5 events (token
+ * deltas + tool progress + status). 500k gives ~5x headroom over the
+ * worst legit run we've measured. Hitting it requires either a model
+ * stream looping pathologically or an adversarial tool spamming progress
+ * events — either way, terminating the run with a clear error is the
+ * correct response. Operators see a warn log; the agent's next turn can
+ * pick up from persisted history.
+ */
+const DEFAULT_MAX_EVENTS_PER_RUN = 500_000;
 
 /** Detach callback returned by {@link RunBus.attach}. */
 export type DetachFn = () => void;
@@ -52,9 +71,13 @@ export class RunBus {
   private runs = new Map<string, RunLog>();
   /** How long a terminal run's log is retained for late re-attach. */
   private readonly graceMs: number;
+  /** Per-run event cap. See {@link DEFAULT_MAX_EVENTS_PER_RUN}. Configurable
+   *  via constructor for tests; production should leave it at the default. */
+  private readonly maxEventsPerRun: number;
 
-  constructor(graceMs = 30_000) {
+  constructor(graceMs = 30_000, maxEventsPerRun = DEFAULT_MAX_EVENTS_PER_RUN) {
     this.graceMs = graceMs;
+    this.maxEventsPerRun = maxEventsPerRun;
   }
 
   /**
@@ -113,10 +136,49 @@ export class RunBus {
    * Append an event to the run's log and fan it out to live subscribers.
    * No-op if the run isn't active (defensive — late engine events after a
    * cancel shouldn't resurrect a terminated log).
+   *
+   * If appending this event would exceed {@link maxEventsPerRun}, the run
+   * is aborted, a synthetic terminal `error` event is appended and fanned
+   * out (so viewers see the cause rather than a silent stop), and the run
+   * is marked `error`. Subsequent publishes during the same tick are
+   * dropped by the standard `status !== "running"` guard.
    */
   publish(conversationId: string, type: string, data: unknown): BufferedRunEvent | null {
     const log = this.runs.get(conversationId);
     if (!log || log.status !== "running") return null;
+
+    // Overflow check BEFORE seq increment / push: the terminal error event
+    // itself counts toward seq but is intentionally allowed past the cap so
+    // viewers always see why generation stopped.
+    if (!log.bufferOverflowed && log.events.length >= this.maxEventsPerRun) {
+      log.bufferOverflowed = true;
+      console.warn(
+        `[run-bus] conversation=${conversationId} hit per-run event cap ` +
+          `(${this.maxEventsPerRun}); aborting turn. This indicates a runaway ` +
+          `producer (model stream looping or tool spamming progress events).`,
+      );
+      log.abort.abort();
+      log.seq += 1;
+      const errEvt: BufferedRunEvent = {
+        seq: log.seq,
+        type: "error",
+        data: {
+          error: "buffer_overflow",
+          message: `Per-run event cap exceeded (${this.maxEventsPerRun}). Turn aborted.`,
+        },
+      };
+      log.events.push(errEvt);
+      for (const fn of log.eventListeners) {
+        try {
+          fn(errEvt);
+        } catch {
+          // A failing subscriber must not break the fan-out to others.
+        }
+      }
+      this.end(conversationId, "error");
+      return errEvt;
+    }
+
     log.seq += 1;
     const evt: BufferedRunEvent = { seq: log.seq, type, data };
     log.events.push(evt);
