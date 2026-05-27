@@ -1,7 +1,7 @@
 import { textContent } from "../engine/content-helpers.ts";
 import type { ToolResult } from "../engine/types.ts";
 import type { CreateUserResult, IdentityProvider, UserIdentity } from "../identity/provider.ts";
-import type { UserStore } from "../identity/user.ts";
+import type { User, UserStore } from "../identity/user.ts";
 import type { InProcessTool } from "./in-process-app.ts";
 
 // ── Types ─────────────────────────────────────────────────────────
@@ -28,6 +28,16 @@ function permissionDenied(): ToolResult {
   };
 }
 
+/**
+ * Count org owners that are still active (not soft-deleted). The last-owner
+ * guards on both the update (demote) and delete (deactivate) paths use this so
+ * a deactivated owner can never be mistaken for a live one — otherwise you
+ * could demote/deactivate the last *active* owner and lock the org out.
+ */
+function activeOwnerCount(users: User[]): number {
+  return users.filter((u) => u.orgRole === "owner" && !u.deletedAt).length;
+}
+
 // ── Tool factory ──────────────────────────────────────────────────
 
 export function createManageUsersTool(ctx: ManageUsersContext): InProcessTool {
@@ -40,8 +50,9 @@ export function createManageUsersTool(ctx: ManageUsersContext): InProcessTool {
       properties: {
         action: {
           type: "string",
-          enum: ["create", "update", "delete", "list"],
-          description: "Action to perform.",
+          enum: ["create", "update", "delete", "restore", "list"],
+          description:
+            'Action to perform. "delete" deactivates the user (soft delete) and revokes access; "restore" re-enables a deactivated user.',
         },
         email: {
           type: "string",
@@ -78,6 +89,8 @@ export function createManageUsersTool(ctx: ManageUsersContext): InProcessTool {
           return handleUpdate(ctx, input);
         case "delete":
           return handleDelete(ctx, input);
+        case "restore":
+          return handleRestore(ctx, input);
         case "list":
           return handleList(ctx);
         default:
@@ -200,13 +213,12 @@ async function handleUpdate(
   }
 
   try {
-    // Safety check: cannot downgrade the last owner
+    // Safety check: cannot downgrade the last active owner
     if (patch.orgRole && patch.orgRole !== "owner") {
       const currentUser = await ctx.userStore.get(userId);
-      if (currentUser?.orgRole === "owner") {
+      if (currentUser?.orgRole === "owner" && !currentUser.deletedAt) {
         const allUsers = await ctx.userStore.list();
-        const ownerCount = allUsers.filter((u) => u.orgRole === "owner").length;
-        if (ownerCount <= 1) {
+        if (activeOwnerCount(allUsers) <= 1) {
           return {
             content: textContent(
               "Cannot change the role of the last owner. Promote another user to owner first.",
@@ -271,10 +283,9 @@ async function handleDelete(
       };
     }
 
-    if (user.orgRole === "owner") {
+    if (user.orgRole === "owner" && !user.deletedAt) {
       const allUsers = await ctx.userStore.list();
-      const ownerCount = allUsers.filter((u) => u.orgRole === "owner").length;
-      if (ownerCount <= 1) {
+      if (activeOwnerCount(allUsers) <= 1) {
         return {
           content: textContent(
             "Cannot delete the last owner. Promote another user to owner first.",
@@ -284,23 +295,70 @@ async function handleDelete(
       }
     }
 
-    const deleted = await ctx.provider!.deleteUser(userId);
-    if (!deleted) {
+    // Soft delete: stamp a tombstone and revoke access, but keep the record so
+    // the user still appears (as deactivated) and can be restored. We do NOT
+    // hard-delete the provider identity — that's irreversible and re-creating
+    // the user later mints a new ID, orphaning all prior workspace memberships.
+    const deactivated = await ctx.userStore.softDelete(userId);
+    if (!deactivated) {
       return {
         content: textContent(`User not found: ${userId}`),
         isError: true,
       };
     }
 
+    // Drop any cached identity so the access revocation takes effect immediately.
+    ctx.provider?.invalidateUser?.(userId);
+
     return {
-      content: textContent(`Deleted user ${userId}.`),
-      structuredContent: { deleted: true, userId },
+      content: textContent(
+        `Deactivated user ${userId}. They can no longer sign in. Use action "restore" to re-enable.`,
+      ),
+      structuredContent: { deactivated: true, userId, deletedAt: deactivated.deletedAt },
       isError: false,
     };
   } catch (err) {
     return {
       content: textContent(
-        `Failed to delete user: ${err instanceof Error ? err.message : String(err)}`,
+        `Failed to deactivate user: ${err instanceof Error ? err.message : String(err)}`,
+      ),
+      isError: true,
+    };
+  }
+}
+
+async function handleRestore(
+  ctx: ManageUsersContext,
+  input: Record<string, unknown>,
+): Promise<ToolResult> {
+  const userId = input.userId ? String(input.userId) : undefined;
+  if (!userId) {
+    return {
+      content: textContent("userId is required for restore."),
+      isError: true,
+    };
+  }
+
+  try {
+    const restored = await ctx.userStore.restore(userId);
+    if (!restored) {
+      return {
+        content: textContent(`User not found: ${userId}`),
+        isError: true,
+      };
+    }
+
+    ctx.provider?.invalidateUser?.(userId);
+
+    return {
+      content: textContent(`Restored user ${userId}. They can sign in again.`),
+      structuredContent: { restored: true, userId },
+      isError: false,
+    };
+  } catch (err) {
+    return {
+      content: textContent(
+        `Failed to restore user: ${err instanceof Error ? err.message : String(err)}`,
       ),
       isError: true,
     };
@@ -315,6 +373,8 @@ async function handleList(ctx: ManageUsersContext): Promise<ToolResult> {
       email: u.email,
       displayName: u.displayName,
       orgRole: u.orgRole,
+      // Present only for deactivated users so the UI can render a "deleted" state.
+      ...(u.deletedAt ? { deletedAt: u.deletedAt } : {}),
     }));
     return {
       content: textContent(`${result.length} user(s).`),
