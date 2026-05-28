@@ -62,7 +62,36 @@ export function startServer(options: ServerOptions): ServerHandle {
   const internalToken = runtime.getInternalToken();
 
   const mcpSources = runtime.mcpSources();
-  const healthMonitor = new HealthMonitor(mcpSources, runtime.getEventSink());
+  // Wire HealthMonitor into the bundle lifecycle so a detected stdio
+  // crash transitions BundleInstance.state through the lifecycle's
+  // recordCrash/Recovery/Dead funnel. This is what gives the operator
+  // a single warn-on-first-failure log instead of one warn per chat
+  // turn forever (issue #194), and keeps the Configure UI's state pill
+  // accurate when a subprocess dies mid-session.
+  const lifecycle = runtime.getLifecycle();
+  const healthMonitor = new HealthMonitor(mcpSources, runtime.getEventSink(), {
+    reportSourceTransition: (source, to) => {
+      // Resolve source → BundleInstance by (serverName, wsId). McpSource
+      // instances stamped with workspaceId via bundleContext at
+      // construction time — see `McpSource.getWorkspaceId`. The wsId
+      // disambiguates the same connector installed in multiple
+      // workspaces; without it a crash in workspace A could land on
+      // workspace B's BundleInstance (whichever the iteration hit first),
+      // leaving the actual crashed bundle stuck at `running` in its
+      // workspace's Configure UI. In-process platform sources and
+      // sources missing a bundleContext (rare) return undefined and we
+      // silently skip — they don't back a BundleInstance.
+      const wsId = source.getWorkspaceId();
+      if (!wsId) return;
+      const inst = runtime
+        .getBundleInstances()
+        .find((i) => i.serverName === source.name && i.wsId === wsId);
+      if (!inst) return;
+      if (to === "crashed") lifecycle.recordCrash(inst.serverName, inst.wsId);
+      else if (to === "running") lifecycle.recordRecovery(inst.serverName, inst.wsId);
+      else lifecycle.recordDead(inst.serverName, inst.wsId);
+    },
+  });
   healthMonitor.start();
 
   // SSE event manager — listens to runtime events and broadcasts to clients

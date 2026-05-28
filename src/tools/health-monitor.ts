@@ -1,18 +1,18 @@
 import type { EventSink } from "../engine/types.ts";
 import type { McpSource } from "./mcp-source.ts";
 
-export type BundleState = "healthy" | "restarting" | "dead";
+export type HealthRecordState = "healthy" | "restarting" | "dead";
 
 export interface BundleHealth {
   name: string;
-  state: BundleState;
+  state: HealthRecordState;
   uptime: number | null;
   restartCount: number;
 }
 
 interface BundleRecord {
   source: McpSource;
-  state: BundleState;
+  state: HealthRecordState;
   restartCount: number;
 }
 
@@ -20,9 +20,31 @@ const MAX_RESTARTS = 5;
 const DEFAULT_BASE_DELAY_MS = 1000;
 const DEFAULT_CHECK_INTERVAL_MS = 30_000;
 
+/**
+ * Reported HealthMonitor transition for the BundleInstance underlying a
+ * source. `crashed` and `dead` map to `lifecycle.recordCrash` /
+ * `recordDead`; `running` maps to `recordRecovery`. The single shape
+ * pushes the per-method switch + source→instance lookup into the
+ * caller (`startServer`) so HealthMonitor stays unaware of lifecycle
+ * internals — useful when the caller wants to inject a different
+ * backing system (tests, alternative observability paths).
+ */
+export type HealthMonitorTransition = "crashed" | "running" | "dead";
+
 export interface HealthMonitorOptions {
   checkIntervalMs?: number;
   baseDelayMs?: number;
+  /**
+   * Propagate a detected health transition back to `BundleInstance.state`
+   * via the bundle lifecycle. Without this hook the URL bundle path
+   * (which funnels through `recordConnectionStateChange`) still works,
+   * but stdio subprocess crashes leave the user-facing state stuck at
+   * `running`. Hook is no-op safe; the caller is responsible for the
+   * source → instance resolution (returning early if the source doesn't
+   * back any BundleInstance, e.g. shared or in-process platform sources).
+   * See issue #194 for the operator log story this enables.
+   */
+  reportSourceTransition?: (source: McpSource, to: HealthMonitorTransition) => void;
 }
 
 /**
@@ -34,6 +56,7 @@ export class HealthMonitor {
   private timer: ReturnType<typeof setInterval> | null = null;
   private checkIntervalMs: number;
   private baseDelayMs: number;
+  private reportSourceTransition: HealthMonitorOptions["reportSourceTransition"];
 
   constructor(
     sources: McpSource[],
@@ -42,9 +65,10 @@ export class HealthMonitor {
   ) {
     this.checkIntervalMs = opts.checkIntervalMs ?? DEFAULT_CHECK_INTERVAL_MS;
     this.baseDelayMs = opts.baseDelayMs ?? DEFAULT_BASE_DELAY_MS;
+    this.reportSourceTransition = opts.reportSourceTransition;
     this.records = sources.map((source) => ({
       source,
-      state: "healthy" as BundleState,
+      state: "healthy" as HealthRecordState,
       restartCount: 0,
     }));
   }
@@ -98,6 +122,14 @@ export class HealthMonitor {
       },
     });
 
+    // Propagate to BundleInstance.state on first detection only. The
+    // `record.state === "healthy"` guard distinguishes the first failure
+    // from subsequent sweeps that find us in "restarting" — we don't want
+    // to report crashed on every poll cycle while a restart is pending.
+    if (record.state === "healthy") {
+      this.reportSourceTransition?.(record.source, "crashed");
+    }
+
     // Check if we've exhausted restart attempts
     if (record.restartCount >= MAX_RESTARTS) {
       record.state = "dead";
@@ -109,6 +141,7 @@ export class HealthMonitor {
           ...(remote ? { remote: true } : {}),
         },
       });
+      this.reportSourceTransition?.(record.source, "dead");
       return;
     }
 
@@ -149,6 +182,7 @@ export class HealthMonitor {
           ...(remote ? { remote: true } : {}),
         },
       });
+      this.reportSourceTransition?.(record.source, "running");
     } else {
       // Restart failed — check again on next cycle (might hit max)
       record.state = "restarting";

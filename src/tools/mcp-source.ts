@@ -321,6 +321,24 @@ export class McpSource implements ToolSource {
     return this.mode.type === "remote";
   }
 
+  /**
+   * Workspace this source was constructed for, when available. Bundle-
+   * spawned sources (URL, stdio, named, local) always carry a workspace
+   * via `bundleContext.workspaceId` — that is the field returned here.
+   * In-process platform sources and short-lived test sources don't pass
+   * a `bundleContext` and return `undefined`.
+   *
+   * Used by `HealthMonitor`'s `reportSourceTransition` hook so the
+   * source → BundleInstance lookup is keyed on `(serverName, wsId)`
+   * rather than name alone. Without the wsId disambiguation, the same
+   * bundle (e.g. `linear-mcp`) installed in two workspaces would all
+   * route their crash detection to whichever instance happened to be
+   * first in iteration order, leaving the other stuck at `running`.
+   */
+  getWorkspaceId(): string | undefined {
+    return this.bundleContext?.workspaceId;
+  }
+
   async start(): Promise<void> {
     // Fresh stderr state on every start. Restart cycles must not bleed
     // a dead instance's tail into the new instance's crash report.

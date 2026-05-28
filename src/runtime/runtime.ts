@@ -1647,19 +1647,27 @@ export class Runtime {
     return [...names];
   }
 
-  /** Get MCP sources across all workspace registries (for health monitoring). */
+  /** Get MCP sources across all workspace registries (for health monitoring).
+   *
+   * Returns every McpSource instance — no dedupe by `source.name`.
+   * The same bundle (e.g. `linear-mcp`) installed in workspaces A and B
+   * produces two distinct McpSource processes, both of which need
+   * monitoring; collapsing them would leave one workspace's
+   * `BundleInstance.state` permanently stale on a crash.
+   *
+   * `Set<McpSource>` keys on instance identity so any McpSource
+   * registered directly in multiple workspace registries is monitored
+   * once. `SharedSourceRef` wrappers don't satisfy `instanceof McpSource`
+   * and are passed over here — their inner source is monitored via the
+   * native registry it was constructed in. */
   mcpSources(): McpSource[] {
-    const sources: McpSource[] = [];
-    const seen = new Set<string>();
+    const sources = new Set<McpSource>();
     for (const reg of this._workspaceRegistries.values()) {
       for (const s of reg.getSources()) {
-        if (s instanceof McpSource && !seen.has(s.name)) {
-          seen.add(s.name);
-          sources.push(s);
-        }
+        if (s instanceof McpSource) sources.add(s);
       }
     }
-    return sources;
+    return [...sources];
   }
 
   /** Get all tracked bundle instances (unfiltered — use getBundleInstancesForWorkspace for scoped access). */
