@@ -101,6 +101,7 @@ import type { Runtime } from "../runtime/runtime.ts";
 import { IDENTITY_SOURCES } from "../tools/identity-sources.ts";
 import { McpSource } from "../tools/mcp-source.ts";
 import type { ToolRegistry } from "../tools/registry.ts";
+import { resolveClientIp } from "./client-ip.ts";
 import {
   createMcpTaskStore,
   type McpTaskStore,
@@ -1063,19 +1064,26 @@ function jsonRpcError(status: number, code: number, message: string): Response {
  * Build a `key=value` log fragment with the request context that matters for
  * session-miss diagnosis: a sessionId prefix (UUIDs are not sensitive but the
  * prefix keeps lines greppable), identity (for cross-tenant correlation), and
- * the client IP from `x-forwarded-for` (the ALB sets it).
+ * the client IP claim.
+ *
+ * `ip` is the canonical untrusted value (`"direct"`) — matches what the rate
+ * limiter keys on. `forwarded-for=<value>` appears only when the request
+ * carries an `X-Forwarded-For` header, and is logged as a *claim*, not as
+ * authoritative IP — the platform has no shared secret with any upstream
+ * proxy so the header is spoofable end-to-end.
  *
  * Stage 2: the workspace key is gone — sessions are identity-bound and
  * carry no workspace pointer. Routing context (the parsed workspace) is
  * stamped on per-tool-call log lines, not session-level diagnostics.
  */
-function fmtSessionContext(
+export function fmtSessionContext(
   request: Request,
   sessionId: string | null,
   sessionCtx?: McpSessionContext,
 ): string {
   const sidPrefix = sessionId ? sessionId.slice(0, 8) : "none";
   const identityId = sessionCtx?.identity?.id ?? "none";
-  const ip = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ?? "direct";
-  return `sessionId=${sidPrefix} identity=${identityId} ip=${ip}`;
+  const { ip, forwardedFor } = resolveClientIp(request);
+  const claim = forwardedFor ? ` forwarded-for=${forwardedFor}` : "";
+  return `sessionId=${sidPrefix} identity=${identityId} ip=${ip}${claim}`;
 }

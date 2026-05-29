@@ -6,6 +6,7 @@ import {
   isAuthError,
   resolveAuthMode,
 } from "../../../src/api/auth-middleware.ts";
+import type { EngineEvent, EventSink } from "../../../src/engine/types.ts";
 import type {
   IdentityProvider,
   UserIdentity,
@@ -15,6 +16,14 @@ import type { OrgRole } from "../../../src/identity/types.ts";
 import type { User } from "../../../src/identity/user.ts";
 
 const noopSink = new NoopEventSink();
+
+/** EventSink that records every emitted event, for asserting audit payloads. */
+class CapturingSink implements EventSink {
+  readonly events: EngineEvent[] = [];
+  emit(event: EngineEvent): void {
+    this.events.push(event);
+  }
+}
 
 // ── Test helpers ──────────────────────────────────────────────────
 
@@ -240,6 +249,54 @@ describe("authenticateRequest — internal token", () => {
     });
     const result = await authenticateRequest(req, devOptions);
     expect(isAuthError(result)).toBe(false);
+  });
+});
+
+// ── Audit logging on auth failure ─────────────────────────────────
+
+describe("authenticateRequest — audit.auth_failure payload", () => {
+  const identity = makeIdentity();
+  const provider = createMockProvider("good-key", identity);
+
+  function failedAuthOptions(sink: EventSink) {
+    return {
+      mode: { type: "adapter", provider } as AuthMode,
+      internalToken: TEST_INTERNAL_TOKEN,
+      eventSink: sink,
+    };
+  }
+
+  it("emits ip='direct' regardless of X-Forwarded-For (never trusted)", async () => {
+    const sink = new CapturingSink();
+    const req = makeRequest("/v1/shell", {
+      headers: { "X-Forwarded-For": "1.2.3.4" },
+    });
+    await authenticateRequest(req, failedAuthOptions(sink));
+
+    const audit = sink.events.find((e) => e.type === "audit.auth_failure");
+    expect(audit).toBeDefined();
+    expect(audit!.data.ip).toBe("direct");
+  });
+
+  it("preserves X-Forwarded-For first hop as forwardedFor (forensic claim)", async () => {
+    const sink = new CapturingSink();
+    const req = makeRequest("/v1/shell", {
+      headers: { "X-Forwarded-For": "1.2.3.4, 10.0.0.1" },
+    });
+    await authenticateRequest(req, failedAuthOptions(sink));
+
+    const audit = sink.events.find((e) => e.type === "audit.auth_failure");
+    expect(audit!.data.forwardedFor).toBe("1.2.3.4");
+  });
+
+  it("emits forwardedFor=null when X-Forwarded-For absent", async () => {
+    const sink = new CapturingSink();
+    const req = makeRequest("/v1/shell");
+    await authenticateRequest(req, failedAuthOptions(sink));
+
+    const audit = sink.events.find((e) => e.type === "audit.auth_failure");
+    expect(audit!.data.forwardedFor).toBeNull();
+    expect(audit!.data.ip).toBe("direct");
   });
 });
 

@@ -2,6 +2,7 @@ import type { EventSink } from "../engine/types.ts";
 import type { IdentityProvider, UserIdentity } from "../identity/provider.ts";
 import type { WorkspaceStore } from "../workspace/workspace-store.ts";
 import { constantTimeEqual, validateInternalToken } from "./auth-utils.ts";
+import { resolveClientIp } from "./client-ip.ts";
 
 // ── Auth mode detection ───────────────────────────────────────────
 
@@ -157,10 +158,19 @@ export async function resolveWorkspace(
 // ── Helpers ───────────────────────────────────────────────────────
 
 function logAuthFailure(req: Request, eventSink: EventSink): void {
-  const ip = req.headers.get("x-forwarded-for") ?? "direct";
-  console.error(`[nimblebrain] AUTH FAIL ip=${ip} timestamp=${new Date().toISOString()}`);
+  // X-Forwarded-For is client-supplied and spoofable; `ip` carries the
+  // canonical untrusted value, `forwardedFor` carries the raw claim for
+  // forensic correlation. See [client-ip.ts](./client-ip.ts).
+  const { ip, forwardedFor } = resolveClientIp(req);
+  const claim = forwardedFor ? ` forwarded-for=${forwardedFor}` : "";
+  console.error(`[nimblebrain] AUTH FAIL ip=${ip}${claim} timestamp=${new Date().toISOString()}`);
   eventSink.emit({
     type: "audit.auth_failure",
-    data: { ip, method: req.method, path: new URL(req.url).pathname },
+    data: {
+      ip,
+      forwardedFor,
+      method: req.method,
+      path: new URL(req.url).pathname,
+    },
   });
 }
