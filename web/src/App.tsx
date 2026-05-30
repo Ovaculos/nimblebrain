@@ -48,6 +48,7 @@ import { ModelTab } from "./pages/settings/ModelTab";
 import { OrgAboutTab } from "./pages/settings/OrgAboutTab";
 import { OrgRegistriesTab } from "./pages/settings/OrgRegistriesTab";
 import { OrgSettingsPage } from "./pages/settings/OrgSettingsPage";
+import { OrgSkillsTab } from "./pages/settings/OrgSkillsTab";
 import { OrgUsageTab } from "./pages/settings/OrgUsageTab";
 import { SettingsAppPanel } from "./pages/settings/SettingsAppPanel";
 import { SkillsTab } from "./pages/settings/SkillsTab";
@@ -464,6 +465,14 @@ function AuthenticatedAppContent({
                 element={
                   <RouteGuard role="org_admin">
                     <OrgRegistriesTab />
+                  </RouteGuard>
+                }
+              />
+              <Route
+                path="skills"
+                element={
+                  <RouteGuard role="org_admin">
+                    <OrgSkillsTab />
                   </RouteGuard>
                 }
               />
