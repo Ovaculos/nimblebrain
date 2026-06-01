@@ -10,6 +10,16 @@
  * highest seq seen and reconnect with `afterSeq=<lastSeq>`, so a dropped
  * connection resumes seamlessly with no gap or duplication — no full reload.
  *
+ * Transport robustness (ported from the former conversation-sse.ts):
+ *   - stale-stream watchdog: a silent connection (proxy idle-timeout, dead
+ *     NAT binding, laptop sleep) stops delivering frames without surfacing an
+ *     error. A periodic watchdog force-reconnects when no frame has arrived
+ *     within `staleThresholdMs`. The reconnect carries `afterSeq=lastSeq`, so
+ *     it's gapless — the seq machinery makes the recovery free.
+ *   - visibility-resume: when a backgrounded tab returns to foreground and the
+ *     stream is stale, reconnect immediately instead of waiting for the next
+ *     watchdog tick.
+ *
  * This viewer assumes the RunBus (seq'd) path. The legacy `/v1/chat` and
  * `/v1/chat/stream` endpoints fan out to the same conversation subscribers via
  * `broadcastToConversation`, which is seq-less (no `id:` line) and not RunBus-
@@ -20,6 +30,12 @@
  */
 
 import { refreshSession } from "./client";
+
+/** No-frame interval after which the watchdog force-reconnects. Slightly above
+ *  the server's 30s heartbeat so a single missed heartbeat doesn't churn. */
+const DEFAULT_STALE_THRESHOLD_MS = 75_000;
+/** How often the watchdog checks for staleness. */
+const DEFAULT_WATCHDOG_TICK_MS = 15_000;
 
 export interface ConversationStreamOptions {
   conversationId: string;
@@ -34,6 +50,11 @@ export interface ConversationStreamOptions {
   onSubscribed?: (info: { isActive: boolean; activeSeq: number }) => void;
   /** Called on unrecoverable error (403/404/auth). */
   onError?: (error: Error) => void;
+  /** No-frame interval before the watchdog force-reconnects. Default 75s.
+   *  Exposed for tests to drive staleness deterministically. */
+  staleThresholdMs?: number;
+  /** Watchdog poll interval. Default 15s. Exposed for tests. */
+  watchdogTickMs?: number;
 }
 
 export interface ConversationStreamConnection {
@@ -47,14 +68,67 @@ const BACKOFF_MULTIPLIER = 2;
 export function connectConversationStream(
   options: ConversationStreamOptions,
 ): ConversationStreamConnection {
-  const { conversationId, apiBase = "", token, onEvent, onSubscribed, onError } = options;
+  const {
+    conversationId,
+    apiBase = "",
+    token,
+    onEvent,
+    onSubscribed,
+    onError,
+    staleThresholdMs = DEFAULT_STALE_THRESHOLD_MS,
+    watchdogTickMs = DEFAULT_WATCHDOG_TICK_MS,
+  } = options;
 
   let closed = false;
   let abortController: AbortController | null = null;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let watchdogTimer: ReturnType<typeof setInterval> | null = null;
   let backoff = INITIAL_BACKOFF_MS;
   // Track the resume point so a reconnect picks up exactly where we left off.
   let lastSeq = options.afterSeq ?? 0;
+  // Timestamp of the last byte received; drives stale-stream detection.
+  let lastFrameAt = Date.now();
+
+  function markFrame(): void {
+    lastFrameAt = Date.now();
+  }
+
+  function isStale(): boolean {
+    return Date.now() - lastFrameAt > staleThresholdMs;
+  }
+
+  /** Abort the live fetch. The read loop's catch path reschedules a reconnect
+   *  (with afterSeq=lastSeq), so this is the single "force a fresh stream" lever
+   *  shared by the watchdog and the visibility handler. */
+  function forceReconnect(): void {
+    abortController?.abort();
+  }
+
+  function startWatchdog(): void {
+    if (watchdogTimer) return;
+    watchdogTimer = setInterval(() => {
+      if (closed) return;
+      if (isStale()) forceReconnect();
+    }, watchdogTickMs);
+  }
+
+  function stopWatchdog(): void {
+    if (watchdogTimer) {
+      clearInterval(watchdogTimer);
+      watchdogTimer = null;
+    }
+  }
+
+  function onVisibilityChange(): void {
+    if (closed) return;
+    if (typeof document === "undefined") return;
+    if (document.visibilityState !== "visible") return;
+    if (isStale()) forceReconnect();
+  }
+
+  if (typeof document !== "undefined") {
+    document.addEventListener("visibilitychange", onVisibilityChange);
+  }
 
   async function connect(): Promise<void> {
     if (closed) return;
@@ -85,6 +159,8 @@ export function connectConversationStream(
       }
 
       backoff = INITIAL_BACKOFF_MS;
+      markFrame();
+      startWatchdog();
       const reader = res.body?.getReader();
       if (!reader) throw new Error("No response body");
 
@@ -96,6 +172,7 @@ export function connectConversationStream(
       for (;;) {
         const { done, value } = await reader.read();
         if (done || closed) break;
+        markFrame();
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split("\n");
         buffer = lines.pop() ?? "";
@@ -129,10 +206,17 @@ export function connectConversationStream(
         }
       }
 
+      stopWatchdog();
       if (!closed) scheduleReconnect();
     } catch (err) {
+      stopWatchdog();
       if (closed) return;
-      if (err instanceof DOMException && err.name === "AbortError") return;
+      if (err instanceof DOMException && err.name === "AbortError") {
+        // Self-aborted by the watchdog / visibility handler — reconnect
+        // immediately (no backoff; the stream was stale, not erroring).
+        connect();
+        return;
+      }
       if (err instanceof Error && err.message.includes("403")) {
         onError?.(err);
         return;
@@ -157,6 +241,10 @@ export function connectConversationStream(
       if (reconnectTimer) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
+      }
+      stopWatchdog();
+      if (typeof document !== "undefined") {
+        document.removeEventListener("visibilitychange", onVisibilityChange);
       }
       abortController?.abort();
       abortController = null;

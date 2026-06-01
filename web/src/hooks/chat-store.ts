@@ -287,6 +287,13 @@ export interface ChatStore {
   retryLastMessage(key: string): string | null;
   simulateError(key: string, message: string): void;
   reset(): void;
+  /** Close every per-slice SSE socket WITHOUT clearing slice state. For
+   *  `pagehide` (tab close / bfcache enter): lets the server reclaim SSE
+   *  slots immediately instead of waiting on TCP teardown, while leaving
+   *  the in-memory slices intact so a bfcache restore can re-attach. The
+   *  heavier {@link reset} (which also clears all state) is for identity
+   *  change, not tab lifecycle. */
+  closeAllConnections(): void;
   sliceCount(): number;
 }
 
@@ -957,6 +964,16 @@ export function createChatStore(): ChatStore {
     for (const cb of streamingListeners) cb();
   }
 
+  function closeAllConnections(): void {
+    // Close sockets only — keep slices so a bfcache restore re-attaches.
+    // No listener notify: the snapshot is unchanged (we're not mutating
+    // isStreaming/state here; the socket close is invisible to render).
+    for (const slice of allSlices) {
+      slice.connection?.close();
+      slice.connection = null;
+    }
+  }
+
   return {
     ensureSlice,
     getSnapshot(key) {
@@ -1006,6 +1023,7 @@ export function createChatStore(): ChatStore {
     retryLastMessage,
     simulateError,
     reset,
+    closeAllConnections,
     sliceCount() {
       return allSlices.size;
     },

@@ -11,7 +11,6 @@ import {
   setPlatformVersion,
   tryBootstrap,
 } from "./api/client";
-import { closeAllConversationEvents } from "./api/conversation-events-client";
 import { closeEventsClient } from "./api/events-client";
 import { AppWithChat } from "./components/AppWithChat";
 import { ErrorBoundary } from "./components/ErrorBoundary";
@@ -572,7 +571,9 @@ export function App() {
   useEffect(() => {
     const onPageHide = (): void => {
       closeEventsClient();
-      closeAllConversationEvents();
+      // Close per-conversation turn-stream sockets so the server reclaims
+      // SSE slots immediately. Slices stay intact for a bfcache restore.
+      chatStore.closeAllConnections();
     };
     window.addEventListener("pagehide", onPageHide);
     return () => {
