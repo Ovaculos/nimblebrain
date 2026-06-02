@@ -18,6 +18,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { NoopEventSink } from "../../../../src/adapters/noop-events.ts";
 import type { McpSource } from "../../../../src/tools/mcp-source.ts";
+import type { UsageReportOutput } from "../../../../src/tools/platform/schemas/usage.ts";
 import { createUsageSource } from "../../../../src/tools/platform/usage.ts";
 
 // ── Fixtures ──────────────────────────────────────────────────────────────
@@ -85,15 +86,9 @@ async function buildSource(): Promise<McpSource> {
   return source;
 }
 
-interface UsageResult {
-  scope: "user" | "org";
-  totals: { tokens: { input: number; output: number }; conversations: number };
-  breakdown: Array<{ key: string }>;
-}
-
-function parse(result: { content?: Array<{ type: string; text?: string }> }): UsageResult {
+function parse(result: { content?: Array<{ type: string; text?: string }> }): UsageReportOutput {
   const text = result.content?.[0]?.text ?? "{}";
-  return JSON.parse(text) as UsageResult;
+  return JSON.parse(text) as UsageReportOutput;
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────
@@ -162,6 +157,27 @@ describe("usage source — scope: org", () => {
     expect(data.totals.tokens.input).toBe(500);
     expect(data.totals.conversations).toBe(2);
     expect(data.breakdown.map((b) => b.key).sort()).toEqual(["usr_alice", "usr_bob"]);
+  });
+
+  test("org admin can request user and day breakdowns in one report", async () => {
+    const src = await buildSource();
+    runtime.hasIdentityProvider = true;
+    runtime.identity = { id: "usr_admin", orgRole: "admin" };
+
+    const client = src.getClient()!;
+    const result = await client.callTool({
+      name: "report",
+      arguments: { scope: "org", period: "all", groupBy: ["user", "day"] },
+    });
+    expect(result.isError).toBeFalsy();
+
+    const data = parse(result as { content?: Array<{ type: string; text?: string }> });
+    expect(data.scope).toBe("org");
+    expect(data.breakdown.map((b) => b.key).sort()).toEqual(["usr_alice", "usr_bob"]);
+    expect(data.breakdowns.user?.map((b) => b.key).sort()).toEqual(["usr_alice", "usr_bob"]);
+    expect(data.breakdowns.day?.map((b) => b.key)).toEqual(["2026-04-10"]);
+    expect(data.totals.tokens.input).toBe(500);
+    expect(data.totals.conversations).toBe(2);
   });
 
   test("member is denied org scope", async () => {

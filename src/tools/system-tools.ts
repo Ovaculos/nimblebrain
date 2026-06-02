@@ -7,6 +7,7 @@ import { isToolEnabled, type ResolvedFeatures } from "../config/features.ts";
 import type { ConfirmationGate } from "../config/privilege.ts";
 import { textContent } from "../engine/content-helpers.ts";
 import type { EventSink, ToolPromotionControls, ToolResult, ToolSchema } from "../engine/types.ts";
+import { NON_ADVANCING_META_KEY } from "../engine/types.ts";
 import type { Runtime } from "../runtime/runtime.ts";
 import type { SelectedSkill } from "../skills/select.ts";
 import type { Skill } from "../skills/types.ts";
@@ -21,6 +22,7 @@ import { McpSource } from "./mcp-source.ts";
 import { createManageToolsToolDefs } from "./platform/manage-tools.ts";
 import type { ToolRegistry } from "./registry.ts";
 import { createManageRegistriesTool } from "./registry-tools.ts";
+import { rankToolSearchResults } from "./search-ranking.ts";
 import { createManageUsersTool, type ManageUsersContext } from "./user-tools.ts";
 import {
   createManageWorkspacesTool,
@@ -97,7 +99,7 @@ export async function createSystemTools(
           query: {
             type: "string",
             description:
-              "Search query (substring match on name + description). Optional — omit to list everything in scope.",
+              "Search query (natural-language terms over name + description). Optional — omit to list everything in scope.",
           },
         },
         required: ["scope"],
@@ -138,7 +140,7 @@ export async function createSystemTools(
         }
 
         // scope === "tools" (default)
-        const q = query.toLowerCase();
+        const q = query.toLowerCase().trim();
         // Identity-level discovery: search the identity's full
         // cross-workspace tool union (the aggregator), not just the
         // calling workspace. The aggregator namespaces nb__search per
@@ -155,16 +157,24 @@ export async function createSystemTools(
             toolEligibilityCtx?.isToolEligible(t) ?? !t.annotations?.["ai.nimblebrain/internal"],
         );
         if (!q) return groupToolsBySource(all);
-        const matches = all.filter(
-          (t) => t.name.toLowerCase().includes(q) || t.description.toLowerCase().includes(q),
-        );
+        const matches = rankToolSearchResults(all, q);
         if (matches.length === 0)
-          return { content: textContent(`No tools matched "${query}".`), isError: false };
-        const lines = [`Found ${matches.length} tool(s) for "${query}":\n`];
-        for (const t of matches) lines.push(`- **${t.name}**: ${t.description}`);
+          // Mark non-advancing (out-of-band, via `_meta`) so repeated empty
+          // searches trip the loop supervisor even as the model varies the
+          // query each call — which otherwise yields a fresh fingerprint every
+          // time and never trips.
+          return {
+            content: textContent(`No tools matched "${query}".`),
+            isError: false,
+            _meta: { [NON_ADVANCING_META_KEY]: true },
+          };
+        const shown = matches.slice(0, 25);
+        const suffix = matches.length > shown.length ? ` (showing top ${shown.length})` : "";
+        const lines = [`Found ${matches.length} tool(s) for "${query}"${suffix}:\n`];
+        for (const t of shown) lines.push(`- **${t.name}**: ${t.description}`);
         return {
           content: textContent(lines.join("\n")),
-          structuredContent: { tools: matches.map((t) => ({ name: t.name })) },
+          structuredContent: { tools: shown.map((t) => ({ name: t.name })) },
           isError: false,
         };
       },

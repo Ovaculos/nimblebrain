@@ -1,31 +1,59 @@
 import { createHash } from "node:crypto";
 import { extractTextForModel, textContent } from "./content-helpers.ts";
-import type { ToolCall, ToolResult } from "./types.ts";
+import { NON_ADVANCING_META_KEY, type ToolCall, type ToolResult } from "./types.ts";
 
 /**
  * Per-run loop supervisor.
  *
- * Watches the (toolName, isError, content) fingerprint of every tool result
- * inside an engine run. If a single tool returns the same fingerprint N
- * times in a row, the supervisor declares that tool stuck and replaces its
- * next result with a synthetic directive instructing the model to stop
- * calling the tool and produce a final response.
+ * Watches the per-call fingerprint of every tool result inside an engine
+ * run. If a single tool returns the same fingerprint N times in a row,
+ * the supervisor declares that tool stuck and replaces its next result
+ * with a synthetic directive instructing the model to stop calling the
+ * tool and produce a final response.
  *
- * Two failure modes this catches:
- *  - Upstream returns identical 4xx errors on every call (e.g. a tool whose
- *    schema-derived args trigger a deterministic server-side rejection).
- *  - Upstream returns identical "empty success" payloads (pagination dead-ends).
+ * Three failure modes this catches:
+ *  - Upstream returns identical 4xx errors on every call (e.g. a tool
+ *    whose schema-derived args trigger a deterministic server-side
+ *    rejection). The model often retries with cosmetic argument tweaks
+ *    and gets the same rejection each time.
+ *  - Upstream returns identical "empty success" payloads to the same
+ *    call (pagination dead-ends; idempotent lookups against an
+ *    unchanged state).
+ *  - A tool reports it made no progress (a discovery search matching
+ *    nothing) while the model keeps varying the query — so input AND
+ *    content differ every call, defeating the two fingerprints below.
  *
- * Per-tool isolation: a stuck tool doesn't trip the supervisor on unrelated
- * tools. Reset-on-different-fingerprint preserves legitimate adaptive retry
- * behaviour (a tool that fails once with error A, then once with error B,
- * then succeeds, never trips).
+ * Fingerprint composition (three shapes of "stuck"):
  *
- * The supervisor itself never aborts the run; the engine reads the verdict
- * and decides what to surface. On a trip the engine also filters the
- * tripped tool out of the model's toolset for the rest of the run, so the
- * model can't call the broken tool again regardless of how it reads the
- * synth directive.
+ *  - NON-ADVANCING: (toolName, NONADVANCING). When `result._meta` carries
+ *    `NON_ADVANCING_META_KEY`, the fingerprint ignores input and content,
+ *    so a tool that keeps reporting no progress trips at N regardless of how
+ *    the model varied the call. Catches the flailing-discovery loop the
+ *    input-aware SUCCESS path deliberately lets through.
+ *
+ *  - SUCCESS: (toolName, S, content, canonical(input)).
+ *    A successful call advances state; "stuck" means the model invoked
+ *    the same call (same name + same input) and got the same answer
+ *    back, repeatedly. Distinct inputs producing structurally-uniform
+ *    success output (e.g. `patch_source(edits=...)` returning
+ *    `applied:true, compiled:true` for each of several edits in a row)
+ *    is progress, not a loop, and must not trip.
+ *
+ *  - ERROR: (toolName, E, content). Input is deliberately omitted so
+ *    the "model retries-with-tweaks against a deterministic rejection"
+ *    failure mode still trips at N repeats — the canonical case the
+ *    supervisor was originally written to catch.
+ *
+ * Per-tool isolation: a stuck tool doesn't trip the supervisor on
+ * unrelated tools. Reset-on-different-fingerprint preserves legitimate
+ * adaptive retry behaviour (a tool that fails once with error A, then
+ * once with error B, then succeeds, never trips).
+ *
+ * The supervisor itself never aborts the run; the engine reads the
+ * verdict and decides what to surface. On a trip the engine also
+ * filters the tripped tool out of the model's toolset for the rest of
+ * the run, so the model can't call the broken tool again regardless of
+ * how it reads the synth directive.
  */
 
 export interface SupervisorConfig {
@@ -77,6 +105,27 @@ interface ToolState {
 const DEFAULT_MAX_REPEATS = 3;
 const DEFAULT_FINGERPRINT_CAP = 512;
 
+/**
+ * Canonical (stable) JSON encoding for the supervisor's input-aware
+ * success fingerprint. Object keys are sorted so that two semantically
+ * identical inputs that arrived with different key orderings hash to
+ * the same value; arrays preserve order (positional). Bypasses
+ * `JSON.stringify`'s implementation-defined key order.
+ *
+ * Not a public utility — the supervisor only needs this for repeat
+ * detection. Inputs are bounded upstream by the model's output limit,
+ * so we don't cap here; if that ever changes, cap to `textCap` to
+ * match the result-text policy.
+ */
+function canonicalJson(value: unknown): string {
+  if (value === undefined) return "null";
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  const obj = value as Record<string, unknown>;
+  const keys = Object.keys(obj).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalJson(obj[k])}`).join(",")}}`;
+}
+
 export function createRunSupervisor(config: SupervisorConfig = {}): RunSupervisor {
   const maxRepeats = config.maxConsecutiveRepeats ?? DEFAULT_MAX_REPEATS;
   const textCap = config.fingerprintTextCap ?? DEFAULT_FINGERPRINT_CAP;
@@ -93,6 +142,22 @@ export function createRunSupervisor(config: SupervisorConfig = {}): RunSuperviso
   }
 
   function fingerprint(call: ToolCall, result: ToolResult): string {
+    // A result a tool explicitly flags as non-advancing (a search that
+    // matched nothing, a lookup against unchanged state) collapses to ONE
+    // canonical fingerprint per tool — input- AND content-agnostic. This is
+    // the counterpart to the input-aware success path below: that path treats
+    // a varied input as progress and never trips, which is right for a tool
+    // doing real work but wrong for a discovery loop where the model varies
+    // the query every call and keeps hitting the same dead end. Flagged
+    // results trip after `maxRepeats` no matter how input/content varied.
+    //
+    // The flag is a single explicit opt-in boolean read by key from `_meta`
+    // (the MCP-blessed metadata channel that survives the tool boundary) —
+    // NOT a fold of the whole result into the hash, which would regress the
+    // guard the way the SUCCESS comment below warns against.
+    if (result._meta?.[NON_ADVANCING_META_KEY] === true) {
+      return createHash("sha1").update(`${call.name}\0NONADVANCING`).digest("hex");
+    }
     // Known limitation: hashing only the first `textCap` chars can
     // false-positive on tools that return a long stable preamble (e.g. a
     // verbose header) followed by a short varying field. Two semantically
@@ -111,8 +176,12 @@ export function createRunSupervisor(config: SupervisorConfig = {}): RunSuperviso
     // WorkspaceState.source_sha (a hash of the edited document) satisfies it.
     // Fix a falsely-tripping tool at the tool, not by weakening the guard.
     const text = extractTextForModel(result.content).trim().slice(0, textCap);
+    // Input is part of the fingerprint for SUCCESS results only — see the
+    // file header for the rationale. Errors stay input-agnostic so the
+    // "deterministic-4xx with retry-with-tweaks" loop still trips.
+    const inputKey = result.isError ? "" : canonicalJson(call.input);
     return createHash("sha1")
-      .update(`${call.name}\0${result.isError ? "E" : "S"}\0${text}`)
+      .update(`${call.name}\0${result.isError ? "E" : "S"}\0${text}\0${inputKey}`)
       .digest("hex");
   }
 
@@ -123,7 +192,11 @@ export function createRunSupervisor(config: SupervisorConfig = {}): RunSuperviso
     // "end the run") — those rot when reread in a later turn where other
     // tools are still callable.
     const directive =
-      `[NB supervisor] Tool \`${toolName}\` returned the same result ${repeats} times in a row; ` +
+      // "made no progress" rather than "returned the same result": accurate
+      // across all three trip modes — identical errors, identical empty
+      // success, AND the non-advancing case where the results vary textually
+      // (different "no match" strings) but represent the same dead end.
+      `[NB supervisor] Tool \`${toolName}\` made no progress ${repeats} times in a row; ` +
       `this tool has been disabled for the rest of this run.\n\n` +
       `Underlying output (last call):\n${originalText}\n\n` +
       `Other tools remain available. Consider an alternative approach or summarize current findings ` +

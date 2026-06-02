@@ -10,6 +10,7 @@ import {
   connectConversationStream,
 } from "../api/conversation-stream";
 import { formatSendError } from "../api/format-error";
+import { appNameFromToolName } from "../lib/namespaced-tool.ts";
 import type {
   AppContext,
   ChatRequest,
@@ -654,14 +655,16 @@ export function createChatStore(): ChatStore {
         const evt = data as ToolStartEvent;
         slice.streamingState = "working";
         slice.preparingTool = null;
-        const separatorIdx = evt.name.indexOf("__");
         const newTool: ToolCallDisplay = {
           id: evt.id,
           name: evt.name,
           status: "running",
           resourceUri: evt.resourceUri,
           input: evt.input,
-          appName: separatorIdx !== -1 ? evt.name.slice(0, separatorIdx) : undefined,
+          // Bare source/app name. Parse the namespace first (#354): a naive
+          // `__` split leaves the `ws_<id>-` prefix attached, which fails
+          // registry.hasSource() with a 403 on the resource-read path.
+          appName: appNameFromToolName(evt.name),
         };
         slice.toolCalls = [...slice.toolCalls, newTool];
         const last = slice.blocks[slice.blocks.length - 1];

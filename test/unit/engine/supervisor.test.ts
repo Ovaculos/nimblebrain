@@ -1,6 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import { createRunSupervisor } from "../../../src/engine/supervisor.ts";
-import type { ToolCall, ToolResult } from "../../../src/engine/types.ts";
+import {
+  NON_ADVANCING_META_KEY,
+  type ToolCall,
+  type ToolResult,
+} from "../../../src/engine/types.ts";
 
 function call(name: string, input: Record<string, unknown> = {}): ToolCall {
   return { id: `call-${Math.random().toString(36).slice(2, 8)}`, name, input };
@@ -194,5 +198,158 @@ describe("supervisor — snapshot", () => {
     expect(snap.trippedTools).toEqual(["foo"]);
     expect(snap.callCounts.foo).toBe(3);
     expect(snap.callCounts.bar).toBe(1);
+  });
+});
+
+describe("supervisor — input-aware success fingerprinting", () => {
+  // Success and error are different shapes of "stuck":
+  //  - Success: distinct inputs producing the same payload is progress.
+  //    The classic motivating case is `patch_source(edits=[...])`
+  //    returning a structurally-uniform `{applied:true, compiled:true}`
+  //    across distinct edits — must NOT trip.
+  //  - Error: deterministic-rejection loops should trip whether or not
+  //    the model rotates arg values between retries (documented failure
+  //    mode), so error fingerprints stay input-agnostic.
+
+  it("3 distinct successful inputs with identical output do NOT trip", () => {
+    const sup = createRunSupervisor();
+    const sameOutput = textResult('{"applied":true,"compiled":true,"reason":null}', false);
+    // Three distinct patch_source-style calls, each returns the same
+    // structurally-uniform success payload. Progress, not a loop.
+    expect(sup.observe(call("patch_source", { find: "a", replace: "b" }), sameOutput).type).toBe(
+      "pass",
+    );
+    expect(sup.observe(call("patch_source", { find: "c", replace: "d" }), sameOutput).type).toBe(
+      "pass",
+    );
+    expect(sup.observe(call("patch_source", { find: "e", replace: "f" }), sameOutput).type).toBe(
+      "pass",
+    );
+    expect(sup.snapshot().trippedTools).toEqual([]);
+  });
+
+  it("3 identical successful calls with identical output still trip", () => {
+    // The genuinely-stuck case: same call (name + input) → same output,
+    // repeated. Still a loop; still trips.
+    const sup = createRunSupervisor();
+    const sameInput = { find: "a", replace: "b" };
+    const sameOutput = textResult('{"applied":true,"compiled":true}', false);
+    expect(sup.observe(call("patch_source", sameInput), sameOutput).type).toBe("pass");
+    expect(sup.observe(call("patch_source", sameInput), sameOutput).type).toBe("pass");
+    const v3 = sup.observe(call("patch_source", sameInput), sameOutput);
+    expect(v3.type).toBe("synth");
+  });
+
+  it("3 distinct erroring inputs with identical output STILL trip", () => {
+    // The documented "deterministic-4xx with retry-with-tweaks" loop —
+    // each call has different input but the same rejection text.
+    // Errors are input-agnostic; this still trips.
+    const sup = createRunSupervisor();
+    const sameError = textResult("AxiosError 400: bad request", true);
+    expect(sup.observe(call("foo", { attempt: 1, payload: "a" }), sameError).type).toBe("pass");
+    expect(sup.observe(call("foo", { attempt: 2, payload: "b" }), sameError).type).toBe("pass");
+    const v3 = sup.observe(call("foo", { attempt: 3, payload: "c" }), sameError);
+    expect(v3.type).toBe("synth");
+  });
+
+  it("canonical input form: reordered object keys hash to the same success fingerprint", () => {
+    // Object key insertion order varies across model providers and SDK
+    // serializers; the supervisor must treat semantically identical
+    // inputs as the same call.
+    const sup = createRunSupervisor();
+    const sameOutput = textResult('{"ok":true}', false);
+    expect(sup.observe(call("foo", { a: 1, b: 2 }), sameOutput).type).toBe("pass");
+    // Same semantic input with different key order.
+    expect(sup.observe(call("foo", { b: 2, a: 1 }), sameOutput).type).toBe("pass");
+    const v3 = sup.observe(call("foo", { a: 1, b: 2 }), sameOutput);
+    expect(v3.type).toBe("synth");
+  });
+
+  it("varied successful inputs and outputs do not trip (baseline)", () => {
+    const sup = createRunSupervisor();
+    for (let i = 0; i < 5; i++) {
+      const v = sup.observe(
+        call("foo", { i }),
+        textResult(`{"index":${i},"applied":true}`, false),
+      );
+      expect(v.type).toBe("pass");
+    }
+  });
+});
+
+describe("supervisor — non-advancing results", () => {
+  const nonAdvancing = (text: string): ToolResult => ({
+    content: [{ type: "text", text }],
+    isError: false,
+    _meta: { [NON_ADVANCING_META_KEY]: true },
+  });
+
+  it("trips after 3 non-advancing results even when input AND output both vary", () => {
+    const sup = createRunSupervisor();
+    // Mirrors the nb__search discovery loop: a fresh query each call and a
+    // distinct "no match" string each time. The input-aware success and
+    // content fingerprints would never collapse these — the `_meta`
+    // non-advancing flag is what does.
+    expect(
+      sup.observe(call("nb__search", { query: "preview" }), nonAdvancing('No tools matched "preview".'))
+        .type,
+    ).toBe("pass");
+    expect(
+      sup.observe(
+        call("nb__search", { query: "collateral" }),
+        nonAdvancing('No tools matched "collateral".'),
+      ).type,
+    ).toBe("pass");
+    const v3 = sup.observe(
+      call("nb__search", { query: "document" }),
+      nonAdvancing('No tools matched "document".'),
+    );
+    expect(v3.type).toBe("synth");
+    if (v3.type === "synth") {
+      expect(v3.trippedTool).toBe("nb__search");
+      expect(v3.consecutiveRepeats).toBe(3);
+    }
+  });
+
+  it("an advancing result between non-advancing ones resets the counter", () => {
+    const sup = createRunSupervisor();
+    expect(
+      sup.observe(call("nb__search", { query: "a" }), nonAdvancing('No tools matched "a".')).type,
+    ).toBe("pass");
+    expect(
+      sup.observe(call("nb__search", { query: "b" }), nonAdvancing('No tools matched "b".')).type,
+    ).toBe("pass");
+    // A real match advances — different fingerprint, resets the streak.
+    expect(
+      sup.observe(call("nb__search", { query: "crm" }), textResult('Found 2 tool(s) for "crm"')).type,
+    ).toBe("pass");
+    expect(
+      sup.observe(call("nb__search", { query: "c" }), nonAdvancing('No tools matched "c".')).type,
+    ).toBe("pass");
+    expect(
+      sup.observe(call("nb__search", { query: "d" }), nonAdvancing('No tools matched "d".')).type,
+    ).toBe("pass");
+    // Only the 3rd CONSECUTIVE non-advancing result trips.
+    expect(
+      sup.observe(call("nb__search", { query: "e" }), nonAdvancing('No tools matched "e".')).type,
+    ).toBe("synth");
+  });
+
+  it("preserves the input-aware success path: varied-input real work never trips", () => {
+    const sup = createRunSupervisor();
+    // patch_source: structurally-uniform success output, distinct inputs each
+    // call — progress, not a loop. The non-advancing flag (absent here) must
+    // not perturb the input-aware success fingerprint.
+    const ok = (): ToolResult => textResult('{"applied":true,"compiled":true}');
+    expect(
+      sup.observe(call("patch_source", { edits: [{ find: "a", replace: "b" }] }), ok()).type,
+    ).toBe("pass");
+    expect(
+      sup.observe(call("patch_source", { edits: [{ find: "c", replace: "d" }] }), ok()).type,
+    ).toBe("pass");
+    expect(
+      sup.observe(call("patch_source", { edits: [{ find: "e", replace: "f" }] }), ok()).type,
+    ).toBe("pass");
+    expect(sup.snapshot().trippedTools).toEqual([]);
   });
 });
