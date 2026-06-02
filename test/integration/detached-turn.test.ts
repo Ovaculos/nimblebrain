@@ -136,6 +136,23 @@ describe("detached turns (server-authoritative streaming)", () => {
     expect(again.conversationId).toBe(conversationId);
     await awaitTurn(conversationId);
   });
+
+  it("starts an identity-level turn with no workspaceId (personal-workspace fallback)", async () => {
+    // Parity with the sync `chat()` path and `/v1/chat`: a chat-start with no
+    // focused workspace (home / identity route) is identity-level, not an
+    // error. startTurn must fall back to the caller's personal workspace
+    // instead of throwing (which surfaced as a raw 500 via handleChatStart).
+    const { conversationId } = await runtime.startTurn({ message: "no workspace here" });
+    expect(conversationId).toMatch(/^conv_/);
+
+    const { status } = await awaitTurn(conversationId);
+    expect(status).toBe("done");
+
+    // Conversation persisted with the personal-workspace breadcrumb.
+    const conv = await runtime.findConversation(conversationId, { userId: "usr_default" });
+    expect(conv).not.toBeNull();
+    expect(conv?.workspaceId).toBe("ws_user_usr_default");
+  });
 });
 
 describe("cancel delivers a terminal frame to live viewers (Stop button)", () => {

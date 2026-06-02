@@ -968,14 +968,20 @@ export class Runtime {
    * {@link RunInProgressError} if a turn is already active for the conversation.
    */
   async startTurn(request: ChatRequest): Promise<{ conversationId: string }> {
-    if (!request.workspaceId) {
-      throw new Error("workspaceId is required. Every chat request must be workspace-scoped.");
-    }
     const store = this.findConversationStore();
     const ownerId = this.resolveOwnerId(request);
+    // `workspaceId` is the FOCUSED workspace (the `/w/:slug` the user is
+    // viewing), optional — exactly as the sync `chat()` path treats it. On a
+    // home / identity route there's no focus, so the turn is identity-level;
+    // fall back to the caller's personal workspace for the conversation
+    // metadata breadcrumb, matching `chat()`'s `sessionWsId` resolution. This
+    // is delegated to `chat()` below, which re-resolves the same fallback for
+    // tool scope. (Pre-Stage-2 this hard-threw; that surfaced as a raw 500 on
+    // a legitimate workspaceless chat-start.)
+    const wsId = request.workspaceId ?? personalWorkspaceIdFor(ownerId);
     const createOpts: CreateConversationOptions = {
       ownerId,
-      workspaceId: request.workspaceId,
+      workspaceId: wsId,
       ...(request.metadata ? { metadata: request.metadata } : {}),
     };
 
