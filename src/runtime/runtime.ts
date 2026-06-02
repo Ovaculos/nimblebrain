@@ -3529,6 +3529,15 @@ export class Runtime {
 
   async shutdown(): Promise<void> {
     await this.telemetryManager.shutdown();
+    // Abort every in-flight detached turn BEFORE removing the sources they
+    // depend on. A detached turn's lifecycle is decoupled from any HTTP
+    // request (it runs to completion server-side), so without this a turn
+    // mid-`doStream()` keeps issuing tool calls into workspace sources that
+    // the loop below is concurrently tearing down — late calls hit removed
+    // sources. RunBus.reset() aborts each run's signal (the engine stops
+    // cooperatively) and clears the run map. Order matters: stop the
+    // producers first, then dismantle their dependencies.
+    this.runBus.reset();
     // Stop all sources across all workspace registries
     for (const [_wsId, reg] of this._workspaceRegistries) {
       for (const name of reg.sourceNames()) {

@@ -207,3 +207,56 @@ describe("cancel delivers a terminal frame to live viewers (Stop button)", () =>
     expect(rt.isTurnActive(conversationId)).toBe(false);
   });
 });
+
+describe("shutdown aborts in-flight detached turns (RunBus teardown)", () => {
+  it("aborts active turn signals before tearing down workspace sources", async () => {
+    const dir = join(tmpdir(), `nimblebrain-shutdown-runbus-${Date.now()}`);
+    mkdirSync(dir, { recursive: true });
+
+    // Gate the model so the turn is genuinely mid-flight when shutdown runs.
+    // Capture the run's abort signal so we can prove shutdown aborted it.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    let capturedSignal: AbortSignal | undefined;
+
+    const rt = await Runtime.start({
+      model: {
+        provider: "custom",
+        adapter: createMockModel(async (options) => {
+          capturedSignal = options.abortSignal;
+          await gate;
+          return { content: [{ type: "text", text: "unreached" }] };
+        }),
+      },
+      noDefaultBundles: true,
+      logging: { disabled: true },
+      workDir: dir,
+    });
+    await provisionTestWorkspace(rt);
+
+    try {
+      const { conversationId } = await rt.startTurn({
+        message: "hang until shutdown",
+        workspaceId: TEST_WORKSPACE_ID,
+      });
+      // Wait until the engine has actually entered the model call (signal
+      // captured) — `isTurnActive` flips true on `runBus.begin()`, before
+      // `doStream`, so it alone would race the capture.
+      await waitFor(() => capturedSignal !== undefined);
+      expect(rt.isTurnActive(conversationId)).toBe(true);
+      expect(capturedSignal?.aborted).toBe(false);
+
+      // Shutdown must abort the in-flight turn (RunBus.reset) so it stops
+      // issuing tool calls BEFORE its workspace sources are removed.
+      await rt.shutdown();
+
+      expect(capturedSignal?.aborted).toBe(true);
+      expect(rt.isTurnActive(conversationId)).toBe(false);
+    } finally {
+      release(); // let the parked engine task unwind
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
