@@ -146,4 +146,33 @@ describe("detached turn HTTP surface", () => {
     const body = await res.json();
     expect(body.error).toBe("conversation_corrupted");
   });
+
+  it("start with a malformed conversationId is 400, not 500 (JSON)", async () => {
+    const res = await fetch(`${baseUrl}/v1/chat/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Workspace-Id": TEST_WORKSPACE_ID },
+      body: JSON.stringify({
+        message: "traversal attempt",
+        conversationId: "../../foo",
+        workspaceId: TEST_WORKSPACE_ID,
+      }),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toBe("bad_request");
+  });
+
+  it("start with a malformed conversationId is 400, not 500 (multipart)", async () => {
+    const form = new FormData();
+    form.set("message", "traversal attempt");
+    form.set("conversationId", "../../foo");
+    const res = await fetch(`${baseUrl}/v1/chat/start`, {
+      method: "POST",
+      headers: { "X-Workspace-Id": TEST_WORKSPACE_ID },
+      body: form,
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toBe("bad_request");
+  });
 });

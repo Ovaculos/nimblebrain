@@ -9,6 +9,7 @@ import { resolveMimeType } from "../files/mime.ts";
 import type { FileEntry } from "../files/types.ts";
 import type { IdentityProvider, UserIdentity } from "../identity/provider.ts";
 import { DEV_IDENTITY } from "../identity/providers/dev.ts";
+import { CONVERSATION_ID_RE } from "../conversation/types.ts";
 import {
   ConversationAccessDeniedError,
   ConversationCorruptedError,
@@ -1598,6 +1599,17 @@ async function parseMultipartChatBody(
   const message = typeof messageRaw === "string" ? messageRaw : "";
 
   const conversationId = formData.get("conversationId");
+  // Reject a malformed conversationId before it reaches store path-building
+  // / ingestFiles (convId feeds the file-store path). The JSON surface gets
+  // this from the ChatRequestBody schema pattern; multipart parses raw, so
+  // validate the same shape here. Mirrors the canonical conv_<16 hex> regex.
+  if (
+    typeof conversationId === "string" &&
+    conversationId &&
+    !CONVERSATION_ID_RE.test(conversationId)
+  ) {
+    return apiError(400, "bad_request", "Invalid conversationId format");
+  }
   const model = formData.get("model");
 
   let appContext: { appName: string; serverName: string } | undefined;
