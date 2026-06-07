@@ -31,6 +31,7 @@
  */
 
 import { Hono } from "hono";
+import { CONVERSATION_ID_RE } from "../../conversation/types.ts";
 import { DEV_IDENTITY } from "../../identity/providers/dev.ts";
 import { ConversationCorruptedError } from "../../runtime/errors.ts";
 import { requireAuth } from "../middleware/auth.ts";
@@ -55,6 +56,13 @@ export function conversationEventRoutes(ctx: AppContext) {
     errorLog(ctx),
     async (c) => {
       const conversationId = c.req.param("id");
+      // Reject a malformed id with 400 before it reaches the store, where
+      // `validateConversationId` would throw a plain Error that bubbles to a
+      // 500. Mirrors the `/v1/chat/start` schema guard so a typo or a
+      // path-traversal probe gets a clean bad-request, not a 5xx.
+      if (!CONVERSATION_ID_RE.test(conversationId)) {
+        return apiError(400, "bad_request", "Invalid conversationId format");
+      }
       const identity = c.var.identity;
 
       // Resolve the caller id. Authenticated request → identity.id.

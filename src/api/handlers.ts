@@ -208,6 +208,12 @@ export async function handleChatCancel(
   runtime: Runtime,
   identity?: UserIdentity,
 ): Promise<Response> {
+  // Reject a malformed id with 400 before it reaches the store, where
+  // `validateConversationId` would throw a plain Error that bubbles to a 500.
+  // Mirrors the `/v1/chat/start` schema guard and the events route.
+  if (!CONVERSATION_ID_RE.test(conversationId)) {
+    return apiError(400, "bad_request", "Invalid conversationId format");
+  }
   const callerId = identity?.id ?? (runtime.getIdentityProvider() ? null : DEV_IDENTITY.id);
   if (!callerId) {
     return apiError(401, "authentication_required", "Authentication required.");
