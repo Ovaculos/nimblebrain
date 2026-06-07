@@ -1023,7 +1023,10 @@ export class Runtime {
         conversationId =
           existing?.id ?? (await store.create({ ...createOpts, id: request.conversationId })).id;
       } catch (err) {
-        this.runBus.evict(request.conversationId);
+        // Release only OUR reservation. Pass the signal `begin` handed back so
+        // that if `load`'s await window let a cancel + a fresh `begin` for the
+        // same id slip in, we don't evict that newer live run.
+        this.runBus.evict(request.conversationId, signal);
         throw err;
       }
     } else {

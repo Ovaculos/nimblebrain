@@ -276,10 +276,24 @@ export class RunBus {
     };
   }
 
-  /** Drop a retained terminal log immediately (test/GC helper). */
-  evict(conversationId: string): void {
+  /**
+   * Drop a retained log immediately (release a failed reservation / GC helper).
+   *
+   * When `expectedSignal` is supplied, the log is dropped only if it's still
+   * the run that owns that signal — the per-run `AbortSignal` is its identity.
+   * This mirrors {@link scheduleGc}'s `=== log` guard: without it, a late
+   * failure-path evict (e.g. a `begin()` reservation whose `store.load()` then
+   * rejects after the original run was cancelled and a *new* turn legitimately
+   * replaced it at the same id) would delete the newer run's log and orphan a
+   * live turn — generation continues with no buffer, no viewers, no terminal
+   * frame. Callers releasing their own reservation pass the signal `begin()`
+   * returned; the no-arg form stays an unconditional drop for GC/tests.
+   */
+  evict(conversationId: string, expectedSignal?: AbortSignal): void {
     const log = this.runs.get(conversationId);
-    if (log?.gcTimer) clearTimeout(log.gcTimer);
+    if (!log) return;
+    if (expectedSignal && log.abort.signal !== expectedSignal) return;
+    if (log.gcTimer) clearTimeout(log.gcTimer);
     this.runs.delete(conversationId);
   }
 
