@@ -1003,29 +1003,30 @@ export class Runtime {
     // returned signal is the RunBus's — NOT the HTTP request's — so a client
     // disconnect won't abort generation.
     //
-    // For a provided id we begin BEFORE touching storage: `begin` is the
-    // serialization point, so a concurrent start with the same id is rejected
-    // here instead of both racing load()->null->create() and clobbering the
-    // file (create is a truncating writeFile with no exists-guard). On any
-    // load/create failure we `evict` to release the reservation — otherwise a
-    // failed start would leave the id stuck "running" and block future turns.
-    // A fresh conversation has no id until create(), so that path begins after.
+    // For a provided id: authorize, THEN reserve the run. Ownership is checked
+    // before `begin` mutates shared run state — an unauthorized caller never
+    // flips `isActive`. There is no `await` between the load+ownership check and
+    // `begin` (the check is synchronous), so nothing can create the conversation
+    // in that gap; `begin` is still the serialization point for `create` (a
+    // concurrent same-id start throws `RunInProgressError` at `begin` before it
+    // can reach the truncating write). On a create failure we `evict` OUR
+    // reservation — passing the signal `begin` returned so that if the create
+    // await let a cancel + a fresh same-id `begin` slip in, we don't evict that
+    // newer live run. A fresh conversation has no id until create(), so that
+    // path begins after.
     const isNew = !request.conversationId;
     let conversationId: string;
     let signal: AbortSignal;
     if (request.conversationId) {
+      const existing = await store.load(request.conversationId);
+      if (existing && existing.ownerId !== ownerId) {
+        throw new ConversationAccessDeniedError(request.conversationId, ownerId);
+      }
       signal = this.runBus.begin(request.conversationId);
       try {
-        const existing = await store.load(request.conversationId);
-        if (existing && existing.ownerId !== ownerId) {
-          throw new ConversationAccessDeniedError(request.conversationId, ownerId);
-        }
         conversationId =
           existing?.id ?? (await store.create({ ...createOpts, id: request.conversationId })).id;
       } catch (err) {
-        // Release only OUR reservation. Pass the signal `begin` handed back so
-        // that if `load`'s await window let a cancel + a fresh `begin` for the
-        // same id slip in, we don't evict that newer live run.
         this.runBus.evict(request.conversationId, signal);
         throw err;
       }
