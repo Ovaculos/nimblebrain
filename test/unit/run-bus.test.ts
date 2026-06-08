@@ -17,15 +17,15 @@ describe("RunBus", () => {
     expect(() => bus.begin("c1")).toThrow(RunInProgressError);
   });
 
-  it("tracks active conversations and clears on end", () => {
+  it("tracks active runs and clears on end", () => {
     const bus = new RunBus();
     bus.begin("c1");
     bus.begin("c2");
-    expect(bus.activeConversationIds().sort()).toEqual(["c1", "c2"]);
     expect(bus.isActive("c1")).toBe(true);
+    expect(bus.isActive("c2")).toBe(true);
     bus.end("c1", "done");
     expect(bus.isActive("c1")).toBe(false);
-    expect(bus.activeConversationIds()).toEqual(["c2"]);
+    expect(bus.isActive("c2")).toBe(true);
   });
 
   it("buffers events and returns each one for live delivery", () => {

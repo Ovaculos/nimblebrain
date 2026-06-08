@@ -937,11 +937,6 @@ export class Runtime {
     return this.runBus.isActive(conversationId);
   }
 
-  /** Conversation ids with an actively generating turn (drives the list dot). */
-  activeTurnConversationIds(): string[] {
-    return this.runBus.activeConversationIds();
-  }
-
   /** Highest event sequence number for a conversation's current/last run. */
   turnSeq(conversationId: string): number {
     return this.runBus.currentSeq(conversationId);
@@ -971,7 +966,9 @@ export class Runtime {
    */
   async startTurn(request: ChatRequest): Promise<{ conversationId: string }> {
     const store = this.findConversationStore();
-    const ownerId = this.resolveOwnerId(request);
+    // Same strict production-vs-dev owner rule as `chat()` and the REST
+    // handlers — one shared resolver, no forked copy to drift out of sync.
+    const ownerId = resolveRequestOwnerId(request.identity, this._identityProvider !== null);
     // `workspaceId` is the FOCUSED workspace (the `/w/:slug` the user is
     // viewing), optional — exactly as the sync `chat()` path treats it. On a
     // home / identity route there's no focus, so the turn is identity-level;
@@ -1107,15 +1104,6 @@ export class Runtime {
       type: "data.changed",
       data: { server: "conversations", tool: "list" },
     });
-  }
-
-  private resolveOwnerId(request: ChatRequest): string {
-    if (request.identity?.id) return request.identity.id;
-    if (!this._identityProvider) return "usr_default";
-    throw new Error(
-      "[runtime.startTurn] no identity on request — the auth middleware must populate " +
-        "request.identity before the turn starts.",
-    );
   }
 
   private async _chatInner(request: ChatRequest, requestSink?: EventSink): Promise<ChatResult> {

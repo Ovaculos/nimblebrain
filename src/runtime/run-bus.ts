@@ -116,15 +116,6 @@ export class RunBus {
     return this.runs.get(conversationId)?.status;
   }
 
-  /** Conversation ids with an actively generating turn. */
-  activeConversationIds(): string[] {
-    const ids: string[] = [];
-    for (const [id, log] of this.runs) {
-      if (log.status === "running") ids.push(id);
-    }
-    return ids;
-  }
-
   /**
    * Append an event to the run's log and return it (the caller delivers it to
    * live viewers). No-op — returns null — if the run isn't active (defensive:
