@@ -105,6 +105,13 @@ export class ConversationEventManager {
         // fan-out. start() runs synchronously and we add to the subscribers
         // map only after replaying, so no live event can interleave ahead of
         // the replay — viewers never see out-of-order deltas.
+        //
+        // This ordering is load-bearing and depends on start() being
+        // SYNCHRONOUS from the replay snapshot through subscribers.set(). Do
+        // NOT make this callback async or `await` anything between here and the
+        // set() below: an await would yield the event loop, letting a live
+        // publish slip into the gap — fanned out to an unregistered subscriber
+        // (lost) or arriving before the replay it should follow (out of order).
         if (replay) {
           for (const e of replay) controller.enqueue(frame(e.type, e.data, e.seq));
         }
