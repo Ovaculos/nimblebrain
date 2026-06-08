@@ -89,9 +89,12 @@ const SSE_ROUTES: Partial<Record<EngineEventType, SseRoute>> = {
   // silently breaking iframe refresh. Revisit when payload grows wsId.
   "data.changed": { scope: "global" },
   // Live conversation-title update (auto-title generation completes after the
-  // turn). Workspace-scoped via the conversation's workspaceId breadcrumb so
-  // it doesn't leak across tenants. The shell routes it to the matching
-  // conversation slice by `conversationId`.
+  // turn). Scoped by the event's `wsId`, which the runtime sets to the OWNER'S
+  // PERSONAL workspace (NOT the conversation's workspaceId) — conversations are
+  // owner-scoped, so this reaches exactly the owner's tabs. Scoping by the
+  // conversation's workspaceId would leak the title to every member of a team
+  // workspace; see the rationale at runtime.ts (generateTitle emit). The shell
+  // routes it to the matching conversation slice by `conversationId`.
   "conversation.title": { scope: "workspace", wsIdField: "wsId" },
   // Org-level config (model preferences, feature flags). Affects every
   // workspace; broadcast to all.

@@ -237,11 +237,9 @@ export function connectConversationStream(
         connect();
         return;
       }
-      if (err instanceof Error && err.message.includes("403")) {
-        teardown();
-        onError?.(err);
-        return;
-      }
+      // A 403/404 is a non-ok RESPONSE, handled (with teardown) on the response
+      // path above — it never throws here, so this catch only sees transport /
+      // 5xx errors, which retry.
       scheduleReconnect();
     }
   }

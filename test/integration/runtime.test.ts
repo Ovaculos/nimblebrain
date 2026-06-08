@@ -73,6 +73,19 @@ describe("Runtime", () => {
     await runtime.shutdown();
   });
 
+  it("refuses to start without an explicit workDir under bun test (leak guard)", async () => {
+    // NODE_ENV=test is set automatically by the bun runner. Without this guard a
+    // missing workDir would default to ~/.nimblebrain and silently pollute the
+    // developer's real conversations/workspaces. Assert the throw so a future
+    // refactor can't quietly remove the protection.
+    await expect(
+      Runtime.start({
+        model: { provider: "custom", adapter: createEchoModel() },
+        noDefaultBundles: true,
+      }),
+    ).rejects.toThrow(/workDir/);
+  });
+
   it("maintains conversation continuity", async () => {
     const workDir = join(testDir, "continuity");
     mkdirSync(workDir, { recursive: true });
