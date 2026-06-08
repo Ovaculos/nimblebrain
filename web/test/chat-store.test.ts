@@ -497,4 +497,32 @@ describe("chat-store viewer", () => {
     after.onSubscribed?.({ isActive: false, activeSeq: 0 });
     expect(store.getSnapshot("kA").isStreaming).toBe(false);
   });
+
+  it("reattachStreaming re-tails a STILL-ACTIVE turn without duplicating the user message", async () => {
+    const store = createChatStore();
+    await store.sendTurn("kA", { text: "go" });
+    const before = latestStream();
+    // Live stream got far enough to consume the optimistic echo + render partial.
+    before.onEvent("user.message", { content: "go" }, 1);
+    before.onEvent("text.delta", { text: "partial" }, 2);
+    expect(store.getSnapshot("kA").messages.map((m) => m.content)).toEqual(["go", "partial"]);
+
+    // bfcache: sockets closed, isStreaming kept; the in-memory tail is the
+    // in-flight turn, built live so it carries NO disk `pending` flag.
+    store.closeAllConnections();
+    store.reattachStreaming();
+    const after = latestStream();
+    expect(after).not.toBe(before);
+
+    // Turn is still running. The resume replays from seq 1 (afterSeq:0),
+    // including the user.message echo — it must NOT append a second turn.
+    after.onSubscribed?.({ isActive: true, activeSeq: 2 });
+    after.onEvent("user.message", { content: "go" }, 1);
+    after.onEvent("text.delta", { text: "partial" }, 2);
+    after.onEvent("text.delta", { text: " done" }, 3);
+
+    const msgs = store.getSnapshot("kA").messages;
+    expect(msgs.map((m) => m.content)).toEqual(["go", "partial done"]);
+    expect(msgs.filter((m) => m.role === "user")).toHaveLength(1);
+  });
 });

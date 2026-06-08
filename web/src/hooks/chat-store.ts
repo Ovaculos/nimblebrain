@@ -1065,6 +1065,13 @@ export function createChatStore(): ChatStore {
     // reconcile in onSubscribed clears the stuck spinner).
     for (const slice of allSlices) {
       if (slice.isStreaming && slice.conversationId && !slice.connection) {
+        // The trailing turn IS this slice's in-flight turn (it's streaming it),
+        // built live so it carries no disk `pending` flag — the resume reconcile
+        // can't recognize it. The replay (afterSeq:0) re-sends the whole turn
+        // from seq 1, including the user.message echo. Mark pendingEcho so that
+        // echo is consumed and the assistant rebuilt from the replay, exactly
+        // like a fresh send — NOT appended as a duplicate user+assistant pair.
+        slice.pendingEcho = true;
         openConnection(slice, slice.conversationId, true);
       }
     }
