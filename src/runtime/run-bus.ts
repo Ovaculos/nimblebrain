@@ -45,10 +45,6 @@ interface RunLog {
   endedAt?: number;
   abort: AbortController;
   gcTimer?: ReturnType<typeof setTimeout>;
-  /** Set once when the per-run event cap is exceeded, so the overflow
-   *  handler only fires once per run (subsequent publishes during the
-   *  same tick are dropped silently). */
-  bufferOverflowed?: boolean;
 }
 
 /**
@@ -146,9 +142,10 @@ export class RunBus {
 
     // Overflow check BEFORE seq increment / push: the terminal error event
     // itself counts toward seq but is intentionally allowed past the cap so
-    // viewers always see why generation stopped.
-    if (!log.bufferOverflowed && log.events.length >= this.maxEventsPerRun) {
-      log.bufferOverflowed = true;
+    // viewers always see why generation stopped. No re-entry guard needed —
+    // `end()` below flips status off "running", so the next publish returns at
+    // the top guard.
+    if (log.events.length >= this.maxEventsPerRun) {
       console.warn(
         `[run-bus] conversation=${conversationId} hit per-run event cap ` +
           `(${this.maxEventsPerRun}); aborting turn. This indicates a runaway ` +
